@@ -7,6 +7,12 @@
 //! execution failure. Any protected-path edit zeroes `S_scope`, reverts the
 //! iteration patch immediately, and reports `BLOCKED` (enforced in every
 //! mode; there is no bypass flag).
+//!
+//! S_sec semantics: the security scan covers the full current content of
+//! every PR-changed file (the spec's "zero new issues" is interpreted as
+//! zero issues on the PR's changed surface), excluding Phase-1 noise paths.
+//! The scope check runs before the concurrent phase; on its failure the
+//! other three checks never run — BLOCKED short-circuits by design.
 
 use serde::Serialize;
 use std::fs;
@@ -247,36 +253,49 @@ fn run_sec_check(changed: &[String]) -> Result<CheckResult, String> {
 }
 
 /// Files changed since the baseline head: committed work on the branch plus
-/// everything in the working tree (the loop's uncommitted patches).
+/// everything in the working tree (the loop's uncommitted patches). Both
+/// git queries use `-z` (NUL-delimited, never quoted), so non-ASCII and
+/// special-character paths survive verbatim for downstream I/O — the
+/// line-based `core.quotePath` output would C-quote them into unusable
+/// names. Phase-1 noise paths (lockfiles, `dist/`, ...) are filtered with
+/// the same rule as the diff intake.
 fn changed_since_baseline(head_sha: &str) -> Result<Vec<String>, String> {
-    let mut changed: Vec<String> = git::run(&["diff", "--name-only", head_sha])?
-        .lines()
+    let diff_raw = git::run(&["diff", "--name-only", "-z", head_sha]).map_err(|e| {
+        format!("baseline head {head_sha} not resolvable locally (is this the PR repository?): {e}")
+    })?;
+    let mut changed: Vec<String> = diff_raw
+        .split('\0')
+        .filter(|path| !path.is_empty())
         .map(str::to_string)
         .collect();
-    for line in git::run(&["status", "--porcelain"])?.lines() {
-        if let Some(path) = porcelain_path(line) {
-            changed.push(path);
-        }
-    }
+    changed.extend(status_changed_fields(&git::run(&[
+        "status",
+        "--porcelain",
+        "-z",
+    ])?));
+    changed.retain(|path| !crate::diff::is_excluded(path));
     changed.sort();
     changed.dedup();
     Ok(changed)
 }
 
-/// Extract the path from a `git status --porcelain` entry, resolving
-/// renames (`R  old -> new`) to their destination side.
-fn porcelain_path(line: &str) -> Option<String> {
-    let path = line.get(3..)?;
-    let path = path.strip_prefix('"').unwrap_or(path);
-    let path = path.trim_end_matches('"');
-    if let Some(idx) = path.find(" -> ") {
-        return Some(path[idx + 4..].to_string());
+/// Parse `git status --porcelain -z` fields. Each entry is `XY <path>`;
+/// rename/copy entries are followed by a second NUL field carrying the
+/// original path, which is skipped (the destination is what exists on disk).
+fn status_changed_fields(raw: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut fields = raw.split('\0').filter(|field| !field.is_empty());
+    while let Some(field) = fields.next() {
+        if field.len() < 4 {
+            continue;
+        }
+        let status = field.as_bytes()[0];
+        paths.push(field[3..].to_string());
+        if status == b'R' || status == b'C' {
+            fields.next();
+        }
     }
-    if path.is_empty() {
-        None
-    } else {
-        Some(path.to_string())
-    }
+    paths
 }
 
 fn read_baseline() -> Result<Baseline, String> {
@@ -286,22 +305,42 @@ fn read_baseline() -> Result<Baseline, String> {
 }
 
 /// Revert every working-tree and index change to HEAD (anti-cheat revert).
+/// Untracked files are removed as well — an injected protected test must
+/// not survive the halt. Gitignored paths (incl. `.quickloop/`, which is
+/// also excluded explicitly) survive because `clean` runs without `-x`.
 fn revert_working_tree() -> Result<(), String> {
     git::run(&["restore", "--staged", "--worktree", "."])?;
+    git::run(&["clean", "-fd", "-e", ".quickloop"])?;
     Ok(())
 }
 
 /// Spawn a tool, drain its pipes on reader threads (preventing the classic
 /// full-pipe deadlock), and kill it when the wall-clock budget expires.
+/// The child runs in its own process group (Unix), so a timeout kill also
+/// reaps cargo's `rustc`/build-script grandchildren — otherwise they keep
+/// the pipes open and the reader joins would hang past the deadline.
 fn run_tool(program: &str, args: &[&str], timeout_secs: u64) -> Result<ToolOutput, String> {
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("spawn {program}: {e}"))?;
-    let mut stdout_pipe = child.stdout.take().ok_or("{program}: no stdout pipe")?;
-    let mut stderr_pipe = child.stderr.take().ok_or("{program}: no stderr pipe")?;
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{program}: no stdout pipe"))?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{program}: no stderr pipe"))?;
     let stdout_thread = thread::spawn(move || {
         let mut buf = String::new();
         let _ = stdout_pipe.read_to_string(&mut buf);
@@ -319,8 +358,17 @@ fn run_tool(program: &str, args: &[&str], timeout_secs: u64) -> Result<ToolOutpu
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if started.elapsed() > timeout {
+                    // Kill the whole process group so grandchildren (rustc,
+                    // build scripts) release the pipes and the reader joins
+                    // below cannot hang past the deadline.
                     let _ = child.kill();
                     let _ = child.wait();
+                    #[cfg(unix)]
+                    {
+                        let _ = Command::new("pkill")
+                            .args(["-KILL", "-g", &child.id().to_string()])
+                            .output();
+                    }
                     break None;
                 }
                 thread::sleep(Duration::from_millis(100));
@@ -414,7 +462,8 @@ fn concise_failures(stdout: &str, stderr: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        changed_since_baseline, evaluate, porcelain_path, read_baseline, score_of, SEC_PATTERNS,
+        changed_since_baseline, evaluate, read_baseline, score_of, status_changed_fields,
+        SEC_PATTERNS,
     };
     use crate::verify::Checks;
     use std::fs;
@@ -423,14 +472,25 @@ mod tests {
     use std::sync::Mutex;
 
     /// `set_current_dir` is process-global, so git-fixture tests serialize
-    /// on this lock and restore the original directory afterwards.
+    /// on this lock and restore the original directory afterwards — the
+    /// guard restores even when the closure panics.
     fn with_cwd<F: FnOnce()>(root: &Path, f: F) {
         static CWD_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = CWD_LOCK.lock().unwrap();
+        let lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let original = std::env::current_dir().unwrap();
         std::env::set_current_dir(root).unwrap();
+        let _restore = CwdRestore(original);
         f();
-        std::env::set_current_dir(original).unwrap();
+        drop(_restore);
+        drop(lock);
+    }
+
+    struct CwdRestore(PathBuf);
+
+    impl Drop for CwdRestore {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
     }
 
     fn git(args: &[&str]) -> String {
@@ -612,20 +672,69 @@ mod tests {
     }
 
     #[test]
-    fn porcelain_paths_handle_renames_and_quotes() {
+    fn status_z_fields_handle_renames_and_skips_original_paths() {
         assert_eq!(
-            porcelain_path("R  old/name.rs -> new/name.rs").as_deref(),
-            Some("new/name.rs")
+            status_changed_fields("M  src/lib.rs\0?? new.rs\0"),
+            vec!["src/lib.rs", "new.rs"]
         );
         assert_eq!(
-            porcelain_path("?? weird \"name\".rs").as_deref(),
-            Some("weird \"name\".rs")
+            status_changed_fields("R  new/name.rs\0old/name.rs\0M  a.rs\0"),
+            vec!["new/name.rs", "a.rs"],
+            "rename destination kept, original path skipped"
         );
-        assert_eq!(
-            porcelain_path("M  src/lib.rs").as_deref(),
-            Some("src/lib.rs")
-        );
-        assert_eq!(porcelain_path("?? "), None);
+        assert_eq!(status_changed_fields(""), Vec::<String>::new());
+        assert_eq!(status_changed_fields("\0\0"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn changed_paths_survive_special_characters_via_z_output() {
+        let root = git_fixture("special-names");
+        with_cwd(&root, || {
+            let head = git(&["rev-parse", "HEAD"]).trim().to_string();
+            // git would C-quote this path in line mode; -z keeps it verbatim.
+            fs::create_dir_all("src").unwrap();
+            fs::write("src/café.rs", "pub fn x() {}\n").unwrap();
+            let changed = changed_since_baseline(&head).unwrap();
+            assert!(
+                changed.contains(&"src/café.rs".to_string()),
+                "non-ASCII path must appear unquoted: {changed:?}"
+            );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blocked_revert_removes_injected_untracked_files() {
+        let root = git_fixture("untracked-blocked");
+        with_cwd(&root, || {
+            let head = git(&["rev-parse", "HEAD"]).trim().to_string();
+            fs::create_dir_all(".quickloop").unwrap();
+            fs::write(
+                ".quickloop/baseline.json",
+                format!(
+                    r#"{{"pr":42,"base_sha":"{head}","head_sha":"{head}","test_file_count":1,"changed_paths":["src/lib.rs"]}}"#
+                ),
+            )
+            .unwrap();
+            // Inject an untracked protected test file and a scratch file.
+            fs::write("tests/injected_test.rs", "#[test]\nfn injected() {}\n").unwrap();
+            fs::write("scratch.txt", "tmp\n").unwrap();
+            let out = evaluate().expect("verify must not crash");
+            assert!(out.blocked, "count drift must yield BLOCKED");
+            assert!(
+                !Path::new("tests/injected_test.rs").exists(),
+                "injected untracked protected file must be removed"
+            );
+            assert!(
+                !Path::new("scratch.txt").exists(),
+                "untracked scratch file is removed by the revert"
+            );
+            assert!(
+                Path::new(".quickloop/baseline.json").exists(),
+                ".quickloop survives"
+            );
+        });
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
