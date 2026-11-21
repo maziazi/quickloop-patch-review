@@ -27,7 +27,7 @@ const EXCLUDED_FILES: [&str; 6] = [
 const EXCLUDED_SEGMENTS: [&str; 3] = ["dist", "vendor", "generated"];
 
 /// Directories never walked when counting protected test files.
-pub(crate) const SKIP_DIRS: [&str; 8] = [
+pub(crate) const SKIP_DIRS: [&str; 11] = [
     ".git",
     "target",
     "node_modules",
@@ -36,6 +36,9 @@ pub(crate) const SKIP_DIRS: [&str; 8] = [
     "vendor",
     "build",
     "generated",
+    ".venv",
+    "venv",
+    "__pycache__",
 ];
 
 #[derive(Debug, Serialize)]
@@ -77,8 +80,25 @@ struct PendingFile {
     current: Option<Hunk>,
 }
 
+/// Validate a PR reference (42, #42, or a GitHub PR URL) before it reaches
+/// `gh`, so a leading `-` can never be interpreted as a gh flag.
+fn validate_pr_ref(pr_ref: &str) -> Result<(), String> {
+    let digits = pr_ref.strip_prefix('#').unwrap_or(pr_ref);
+    let numeric = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+    let github_pr_url = pr_ref.starts_with("https://")
+        && pr_ref.contains("github.com/")
+        && pr_ref.contains("/pull/");
+    if numeric || github_pr_url {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid PR reference '{pr_ref}' (expected 42, #42, or a GitHub PR URL)"
+    ))
+}
+
 /// Execute `quickloop diff <pr>`.
 pub fn run(pr_ref: &str) -> Result<(), String> {
+    validate_pr_ref(pr_ref)?;
     let meta = gh::run(&[
         "pr",
         "view",
@@ -105,18 +125,6 @@ pub fn run(pr_ref: &str) -> Result<(), String> {
     let changed_paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
     let test_file_count = count_protected_files(Path::new("."))?;
 
-    let output = DiffOutput {
-        pr,
-        base_sha: base_sha.clone(),
-        head_sha: head_sha.clone(),
-        test_file_count,
-        files,
-    };
-    println!(
-        "{}",
-        serde_json::to_string(&output).map_err(|e| format!("serialize diff: {e}"))?
-    );
-
     let baseline = Baseline {
         pr,
         base_sha,
@@ -124,16 +132,42 @@ pub fn run(pr_ref: &str) -> Result<(), String> {
         test_file_count,
         changed_paths,
     };
-    write_baseline(&baseline)
+    // Persist the baseline before anything reaches stdout: stdout carries
+    // loop data only, so a failed run must not leave valid JSON behind.
+    write_baseline(&baseline)?;
+
+    let output = DiffOutput {
+        pr: baseline.pr,
+        base_sha: baseline.base_sha.clone(),
+        head_sha: baseline.head_sha.clone(),
+        test_file_count: baseline.test_file_count,
+        files,
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&output).map_err(|e| format!("serialize diff: {e}"))?
+    );
+    Ok(())
 }
 
 /// Parse a unified diff and keep only noise-free hunks. Binary sections,
 /// mode-only changes, and excluded paths carry no hunks and are dropped.
+/// Lines are split on `\n` only (never `.lines()`), so `\r` from CRLF files
+/// survives into the emitted `patch` text — the model transcribes SEARCH
+/// blocks from this JSON and `quickloop patch` matches byte-for-byte, so
+/// any normalization here would break the patch contract upstream.
+/// Context size relies on `gh`/git emitting the default 3 context lines.
 pub fn parse_and_filter(raw: &str) -> Vec<DiffFile> {
     let mut files: Vec<DiffFile> = Vec::new();
     let mut pending: Option<PendingFile> = None;
 
-    for line in raw.lines() {
+    let lines: Vec<&str> = raw.split('\n').collect();
+    let end = if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.len() - 1
+    } else {
+        lines.len()
+    };
+    for line in &lines[..end] {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             flush_pending(&mut pending, &mut files);
             pending = Some(PendingFile {
@@ -142,6 +176,27 @@ pub fn parse_and_filter(raw: &str) -> Vec<DiffFile> {
                 current: None,
             });
             continue;
+        }
+        if let Some(rest) = line.strip_prefix("+++ b/") {
+            // The `+++` header is the authoritative destination path (it
+            // handles quoted and space-containing names). Only trust it
+            // outside hunk bodies: a pure addition line whose content is
+            // `++ b/x` renders as `+++ b/x` inside a hunk.
+            if let Some(p) = pending.as_mut() {
+                if p.current.is_none() {
+                    let candidate = rest
+                        .split('\t')
+                        .next()
+                        .unwrap_or("")
+                        .trim_matches('"')
+                        .trim_end_matches('\r')
+                        .to_string();
+                    if !candidate.is_empty() {
+                        p.path = candidate;
+                        continue;
+                    }
+                }
+            }
         }
         if line.starts_with("@@ ") {
             if let Some(p) = pending.as_mut() {
@@ -186,15 +241,15 @@ fn flush_pending(pending: &mut Option<PendingFile>, files: &mut Vec<DiffFile>) {
 }
 
 /// Extract the destination path from a `diff --git a/<old> b/<new>` tail.
+/// A trailing `\r` (CRLF files) is line metadata, not path content, so it
+/// is stripped here — hunk text keeps its `\r` untouched.
 fn extract_b_path(rest: &str) -> String {
+    let strip = |s: &str| s.trim_matches('"').trim_end_matches('\r').to_string();
     if let Some(idx) = rest.find(" b/") {
-        rest[idx + 3..].trim_matches('"').to_string()
+        strip(&rest[idx + 3..])
     } else {
-        let candidate = rest.rsplit(' ').next().unwrap_or("").trim_matches('"');
-        candidate
-            .strip_prefix("a/")
-            .unwrap_or(candidate)
-            .to_string()
+        let candidate = rest.rsplit(' ').next().unwrap_or("");
+        strip(candidate.strip_prefix("a/").unwrap_or(candidate))
     }
 }
 
@@ -243,7 +298,12 @@ pub fn count_protected_files(root: &Path) -> Result<usize, String> {
             let entry = entry.map_err(|e| format!("dir entry in {}: {e}", dir.display()))?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if path.is_dir() {
+            // file_type() never follows symlinks, so symlinked directories
+            // cannot trap the walk in a cycle.
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("file_type in {}: {e}", dir.display()))?;
+            if file_type.is_dir() {
                 if !SKIP_DIRS.contains(&name.as_str()) {
                     stack.push(path);
                 }
@@ -272,7 +332,7 @@ fn write_baseline(baseline: &Baseline) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_b_path, hunk_starts, is_excluded, parse_and_filter};
+    use super::{extract_b_path, hunk_starts, is_excluded, parse_and_filter, validate_pr_ref};
     use std::fs;
     use std::path::PathBuf;
 
@@ -352,6 +412,44 @@ Binary files a/assets/logo.png and b/assets/logo.png differ
     fn extract_b_path_prefers_destination_side() {
         assert_eq!(extract_b_path("a/old.txt b/new.txt"), "new.txt");
         assert_eq!(extract_b_path("a/only.txt"), "only.txt");
+    }
+
+    #[test]
+    fn crlf_hunks_preserve_carriage_returns() {
+        let fixture = "diff --git a/win.ps1 b/win.ps1\r\nindex aaaaaaa..bbbbbbb 100644\r\n--- a/win.ps1\r\n+++ b/win.ps1\r\n@@ -1,2 +1,2 @@\r\n-old\r\n+new\r\n";
+        let files = parse_and_filter(fixture);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "win.ps1");
+        assert!(
+            files[0].hunks[0].patch.contains("-old\r"),
+            "CR must survive into the patch text for byte-exact SEARCH matching"
+        );
+        assert!(files[0].hunks[0].patch.contains("+new\r"));
+    }
+
+    #[test]
+    fn plus_plus_plus_header_overrides_path_for_quoted_names() {
+        let fixture = "diff --git a/\"weird name.txt\" b/\"weird name.txt\"\nsimilarity index 100%\n--- a/\"weird name.txt\"\n+++ b/\"weird name.txt\"\n@@ -1 +1 @@\n-x\n+y\n";
+        let files = parse_and_filter(fixture);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "weird name.txt");
+    }
+
+    #[test]
+    fn pr_refs_accept_numbers_hash_and_url_only() {
+        assert!(validate_pr_ref("42").is_ok());
+        assert!(validate_pr_ref("#42").is_ok());
+        assert!(
+            validate_pr_ref("https://github.com/maziazi/quickloop-patch-review/pull/1").is_ok()
+        );
+        assert!(validate_pr_ref("").is_err());
+        assert!(validate_pr_ref("abc").is_err());
+        assert!(validate_pr_ref("42x").is_err());
+        assert!(
+            validate_pr_ref("-R owner/repo").is_err(),
+            "gh flag injection must be rejected"
+        );
+        assert!(validate_pr_ref("https://example.com/pull/1").is_err());
     }
 
     #[test]

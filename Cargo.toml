@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["worker", "demo-repo"]
+# Bare `cargo test`/`cargo build` at the root target the worker only;
+# demo-repo's planted-bug tests stay red by design and are exercised via
+# `cargo test --workspace` or an explicit `-p demo-repo`.
+default-members = ["worker"]

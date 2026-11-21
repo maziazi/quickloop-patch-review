@@ -3,7 +3,11 @@
 //! Every SEARCH block must match the target file byte-for-byte exactly
 //! once; zero matches or an ambiguous match rejects the block and aborts
 //! the entire patch set atomically (exit code 2, no partial writes).
-//! Files are never created or deleted.
+//! Files are never created or deleted, and every `path=` is confined to
+//! the repository working tree. The validation phase is fully atomic; the
+//! write phase only runs after all blocks validate, but a mid-write I/O
+//! failure (disk full, permissions) can still leave earlier files written
+//! and exits 1 — an execution error, not a rejection.
 
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -63,6 +67,16 @@ pub fn run(patch_file: &Path) -> Result<Outcome, String> {
         if !rejected.is_empty() {
             break;
         }
+        // Model-authored `path=` values must stay inside the repository:
+        // writes outside the working tree are invisible to `git diff`, so
+        // the S_scope anti-cheat could never see or revert them.
+        if let Some(reason) = confinement_violation(&block.path) {
+            rejected.push(Rejected {
+                path: block.path.clone(),
+                reason,
+            });
+            break;
+        }
         let content = match contents.get(&block.path) {
             Some(current) => current.clone(),
             None => {
@@ -117,6 +131,34 @@ pub fn run(patch_file: &Path) -> Result<Outcome, String> {
         serde_json::to_string(&outcome).map_err(|e| format!("serialize patch outcome: {e}"))?
     );
     Ok(outcome)
+}
+
+/// Return a rejection reason when a model-authored path is not a normal
+/// relative path confined to the repository (no absolute paths, no `..`
+/// escape, no Windows/unsupported components). `Ok(())` paths only ever
+/// resolve inside the worker's working directory (the target repo root).
+fn confinement_violation(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return Some("absolute_path_not_allowed".to_string());
+    }
+    let mut depth: isize = 0;
+    for component in p.components() {
+        match component {
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return Some("path_escapes_repository".to_string());
+                }
+            }
+            other => {
+                return Some(format!("unsupported_path_component:{other:?}"));
+            }
+        }
+    }
+    None
 }
 
 /// Parse fenced ```patch path=<file> blocks with SEARCH/REPLACE markers.
@@ -177,9 +219,21 @@ fn parse_blocks(text: &str) -> Result<Vec<Block>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_blocks, run, Outcome};
+    use super::{confinement_violation, parse_blocks, run};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// `set_current_dir` is process-global, so CWD-dependent tests serialize
+    /// on this lock and restore the original directory afterwards.
+    fn with_cwd<F: FnOnce()>(root: &Path, f: F) {
+        static CWD_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(root).unwrap();
+        f();
+        std::env::set_current_dir(original).unwrap();
+    }
 
     #[test]
     fn parses_fenced_blocks_with_path_attribute() {
@@ -208,22 +262,20 @@ mod tests {
     #[test]
     fn applies_single_block_and_reports_exit_code_zero() {
         let root = temp_root("apply");
-        let target = root.join("score.rs");
-        fs::write(&target, "fn a() {}\nfn b() {}\n").unwrap();
-        let patch_file = root.join("fix.patch");
+        fs::write(root.join("score.rs"), "fn a() {}\nfn b() {}\n").unwrap();
         fs::write(
-            &patch_file,
-            format!(
-                "```patch path={}\n<<<<<<< SEARCH\nfn b() {{}}\n=======\nfn b() {{ /* fixed */ }}\n>>>>>>> REPLACE\n```\n",
-                target.display()
-            ),
+            root.join("fix.patch"),
+            "```patch path=score.rs\n<<<<<<< SEARCH\nfn b() {}\n=======\nfn b() { /* fixed */ }\n>>>>>>> REPLACE\n```\n",
         )
         .unwrap();
-        let outcome = run(&patch_file).unwrap();
-        assert!(outcome.ok);
-        assert_eq!(outcome.exit_code(), 0);
+        with_cwd(&root, || {
+            let outcome = run(Path::new("fix.patch")).unwrap();
+            assert!(outcome.ok);
+            assert_eq!(outcome.exit_code(), 0);
+            assert_eq!(outcome.applied, vec!["score.rs"]);
+        });
         assert_eq!(
-            fs::read_to_string(&target).unwrap(),
+            fs::read_to_string(root.join("score.rs")).unwrap(),
             "fn a() {}\nfn b() { /* fixed */ }\n"
         );
         let _ = fs::remove_dir_all(root);
@@ -232,23 +284,19 @@ mod tests {
     #[test]
     fn applies_sequential_blocks_to_the_same_file() {
         let root = temp_root("sequential");
-        let target = root.join("score.rs");
-        fs::write(&target, "let a = 1;\nlet b = 2;\n").unwrap();
-        let patch_file = root.join("fix.patch");
+        fs::write(root.join("score.rs"), "let a = 1;\nlet b = 2;\n").unwrap();
         fs::write(
-            &patch_file,
-            format!(
-                "```patch path={}\n<<<<<<< SEARCH\nlet a = 1;\n=======\nlet a = 10;\n>>>>>>> REPLACE\n```\n```patch path={}\n<<<<<<< SEARCH\nlet b = 2;\n=======\nlet b = 20;\n>>>>>>> REPLACE\n```\n",
-                target.display(),
-                target.display()
-            ),
+            root.join("fix.patch"),
+            "```patch path=score.rs\n<<<<<<< SEARCH\nlet a = 1;\n=======\nlet a = 10;\n>>>>>>> REPLACE\n```\n```patch path=score.rs\n<<<<<<< SEARCH\nlet b = 2;\n=======\nlet b = 20;\n>>>>>>> REPLACE\n```\n",
         )
         .unwrap();
-        let outcome = run(&patch_file).unwrap();
-        assert!(outcome.ok);
-        assert_eq!(outcome.applied.len(), 1, "same file is reported once");
+        with_cwd(&root, || {
+            let outcome = run(Path::new("fix.patch")).unwrap();
+            assert!(outcome.ok);
+            assert_eq!(outcome.applied.len(), 1, "same file is reported once");
+        });
         assert_eq!(
-            fs::read_to_string(&target).unwrap(),
+            fs::read_to_string(root.join("score.rs")).unwrap(),
             "let a = 10;\nlet b = 20;\n"
         );
         let _ = fs::remove_dir_all(root);
@@ -257,25 +305,22 @@ mod tests {
     #[test]
     fn ambiguous_match_aborts_atomically_without_writing() {
         let root = temp_root("ambiguous");
-        let target = root.join("dup.rs");
         let original = "dup();\ndup();\n";
-        fs::write(&target, original).unwrap();
-        let patch_file = root.join("fix.patch");
+        fs::write(root.join("dup.rs"), original).unwrap();
         fs::write(
-            &patch_file,
-            format!(
-                "```patch path={}\n<<<<<<< SEARCH\ndup();\n=======\nboom();\n>>>>>>> REPLACE\n```\n",
-                target.display()
-            ),
+            root.join("fix.patch"),
+            "```patch path=dup.rs\n<<<<<<< SEARCH\ndup();\n=======\nboom();\n>>>>>>> REPLACE\n```\n",
         )
         .unwrap();
-        let outcome = run(&patch_file).unwrap();
-        assert!(!outcome.ok);
-        assert_eq!(outcome.exit_code(), 2);
-        assert_eq!(outcome.applied.len(), 0);
-        assert_eq!(outcome.rejected[0].reason, "ambiguous_match:2");
+        with_cwd(&root, || {
+            let outcome = run(Path::new("fix.patch")).unwrap();
+            assert!(!outcome.ok);
+            assert_eq!(outcome.exit_code(), 2);
+            assert_eq!(outcome.applied.len(), 0);
+            assert_eq!(outcome.rejected[0].reason, "ambiguous_match:2");
+        });
         assert_eq!(
-            fs::read_to_string(&target).unwrap(),
+            fs::read_to_string(root.join("dup.rs")).unwrap(),
             original,
             "no partial writes"
         );
@@ -283,20 +328,85 @@ mod tests {
     }
 
     #[test]
-    fn missing_target_file_is_rejected_not_a_crash() {
-        let root = temp_root("missing");
+    fn cross_file_rejection_aborts_whole_set() {
+        let root = temp_root("cross");
+        fs::write(root.join("a.rs"), "alpha\n").unwrap();
+        fs::write(root.join("b.rs"), "beta\n").unwrap();
+        // First block is valid for a.rs; second block targets a file whose
+        // content cannot match. The whole set must abort: a.rs stays intact.
+        fs::write(
+            root.join("fix.patch"),
+            "```patch path=a.rs\n<<<<<<< SEARCH\nalpha\n=======\nALPHA\n>>>>>>> REPLACE\n```\n```patch path=c.rs\n<<<<<<< SEARCH\nghost\n=======\nzombie\n>>>>>>> REPLACE\n```\n",
+        )
+        .unwrap();
+        with_cwd(&root, || {
+            let outcome = run(Path::new("fix.patch")).unwrap();
+            assert!(!outcome.ok);
+            assert_eq!(outcome.exit_code(), 2);
+            assert_eq!(outcome.applied.len(), 0, "nothing may be written");
+        });
+        assert_eq!(
+            fs::read_to_string(root.join("a.rs")).unwrap(),
+            "alpha\n",
+            "valid block must NOT be written when the set is rejected"
+        );
+        assert_eq!(fs::read_to_string(root.join("b.rs")).unwrap(), "beta\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn absolute_and_escaping_paths_are_rejected() {
+        let root = temp_root("confine");
         let patch_file = root.join("fix.patch");
         fs::write(
             &patch_file,
-            format!(
-                "```patch path={}\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n```\n",
-                root.join("nope.rs").display()
-            ),
+            "```patch path=/etc/passwd\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n```\n",
         )
         .unwrap();
-        let outcome = run(&patch_file).unwrap();
-        assert!(!outcome.ok);
-        assert_eq!(outcome.rejected[0].reason, "file_not_found");
+        with_cwd(&root, || {
+            let outcome = run(&patch_file).unwrap();
+            assert!(!outcome.ok);
+            assert_eq!(outcome.rejected[0].reason, "absolute_path_not_allowed");
+        });
+        fs::write(
+            &patch_file,
+            "```patch path=../outside.txt\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n```\n",
+        )
+        .unwrap();
+        with_cwd(&root, || {
+            let outcome = run(&patch_file).unwrap();
+            assert!(!outcome.ok);
+            assert_eq!(outcome.rejected[0].reason, "path_escapes_repository");
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn confinement_rules_reject_escape_and_accept_normal_relative_paths() {
+        assert_eq!(
+            confinement_violation("/etc/passwd").as_deref(),
+            Some("absolute_path_not_allowed")
+        );
+        assert!(confinement_violation("../out.txt").is_some());
+        assert!(confinement_violation("a/../../out.txt").is_some());
+        assert!(confinement_violation("demo-repo/src/scoring.rs").is_none());
+        assert!(confinement_violation("./src/lib.rs").is_none());
+        assert!(confinement_violation("src/../src/lib.rs").is_none());
+    }
+
+    #[test]
+    fn missing_target_file_is_rejected_not_a_crash() {
+        let root = temp_root("missing");
+        fs::write(
+            root.join("fix.patch"),
+            "```patch path=nope.rs\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n```\n",
+        )
+        .unwrap();
+        with_cwd(&root, || {
+            let outcome = run(Path::new("fix.patch")).unwrap();
+            assert!(!outcome.ok);
+            assert_eq!(outcome.rejected[0].reason, "file_not_found");
+        });
         let _ = fs::remove_dir_all(root);
     }
 
