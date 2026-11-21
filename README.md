@@ -3,7 +3,7 @@
 **Closed-loop PR review and fix agent for OpenClaw, powered by Kimi K3.1 Pro on Cerebras.**
 
 [![version](https://img.shields.io/badge/version-v0.1.0-orange)](./docs/PLAN.md)
-[![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 [![harness](https://img.shields.io/badge/harness-OpenClaw-6366F1)](https://docs.openclaw.ai)
 [![model](https://img.shields.io/badge/model-Kimi%20K3.1%20Pro%20on%20Cerebras-16A34A)](https://cloud.cerebras.ai)
 
