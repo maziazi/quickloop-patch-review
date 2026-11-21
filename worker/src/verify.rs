@@ -465,33 +465,11 @@ mod tests {
         changed_since_baseline, evaluate, read_baseline, score_of, status_changed_fields,
         SEC_PATTERNS,
     };
+    use crate::testutil::with_cwd;
     use crate::verify::Checks;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::Mutex;
-
-    /// `set_current_dir` is process-global, so git-fixture tests serialize
-    /// on this lock and restore the original directory afterwards — the
-    /// guard restores even when the closure panics.
-    fn with_cwd<F: FnOnce()>(root: &Path, f: F) {
-        static CWD_LOCK: Mutex<()> = Mutex::new(());
-        let lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(root).unwrap();
-        let _restore = CwdRestore(original);
-        f();
-        drop(_restore);
-        drop(lock);
-    }
-
-    struct CwdRestore(PathBuf);
-
-    impl Drop for CwdRestore {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
-        }
-    }
 
     fn git(args: &[&str]) -> String {
         let out = Command::new("git")

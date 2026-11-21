@@ -1,55 +1,102 @@
-//! Honest telemetry types shared by the worker commands.
+//! Honest telemetry records written by the worker.
 //!
-//! All values are sourced directly from Cerebras API `usage`/`time_info`
-//! fields and local monotonic clocks. Never estimate token counts with a
-//! tokenizer, and always label warm-cache vs cold-cache runs.
+//! Worker-side numbers come from local monotonic clocks and the
+//! deterministic gate itself — never estimated. API-side metrics
+//! (`queue_time_s`, `ttft_s`, `output_tps`, `e2e_tps`, `cache_hit_rate`,
+//! `wall_s` per docs/DESIGN.md §4) are owned by the OpenClaw harness and
+//! will join this record when the harness integration lands; the worker
+//! never fabricates them.
 
 use serde::Serialize;
+use std::fs;
+use std::path::Path;
 
-/// Latency and throughput metrics for one model call or one full loop.
-// Consumed by `feat/worker-publish` when telemetry recording lands.
-#[allow(dead_code)]
-#[derive(Debug, Default, Serialize)]
-pub struct Metrics {
-    /// `time_info.queue_time` from the API response (seconds), when present.
+/// One published loop run, persisted to `.quickloop/run-<pr>.json`.
+#[derive(Debug, Serialize)]
+pub struct RunRecord {
+    pub pr: u64,
+    pub iteration: u32,
+    pub score: u32,
+    pub blocked: bool,
+    pub dry_run: bool,
+    /// HEAD after the publish commit; unchanged when nothing was committed.
+    pub commit_sha: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub queue_time_s: Option<f64>,
-    /// Time from request sent to first content token (seconds).
-    pub ttft_s: f64,
-    /// Pure decode duration, last token minus first content token (seconds).
-    pub gen_s: f64,
-    /// `usage.completion_tokens / gen_s`.
-    pub output_tps: f64,
-    /// `usage.completion_tokens / (ttft_s + gen_s)`.
-    pub e2e_tps: f64,
-    /// `cached_tokens / prompt_tokens`; 0.0 on cold-cache runs.
-    pub cache_hit_rate: f64,
-    /// Full wall-clock duration from skill invocation to gate decision.
-    pub wall_s: f64,
+    pub comment_url: Option<String>,
+    /// Whether the publish step actually created a new commit.
+    pub committed: bool,
+    /// Wall-clock seconds spent re-running the deterministic gate.
+    pub verify_wall_s: f64,
+    /// Wall-clock seconds for the whole publish invocation.
+    pub publish_wall_s: f64,
+}
+
+/// Persist the run record; returns the file it was written to.
+pub fn record_run(record: &RunRecord) -> Result<std::path::PathBuf, String> {
+    let dir = Path::new(".quickloop");
+    fs::create_dir_all(dir).map_err(|e| format!("create .quickloop: {e}"))?;
+    let path = dir.join(format!("run-{}.json", record.pr));
+    let data = serde_json::to_string(record).map_err(|e| format!("serialize run record: {e}"))?;
+    fs::write(&path, data).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Metrics;
+    use super::{record_run, RunRecord};
+    use std::fs;
 
     #[test]
-    fn metrics_serialize_compact_without_optional_fields() {
-        let m = Metrics {
-            ttft_s: 0.1,
-            gen_s: 0.2,
-            output_tps: 100.0,
-            e2e_tps: 90.0,
-            cache_hit_rate: 0.85,
-            wall_s: 1.5,
-            queue_time_s: None,
+    fn record_run_writes_compact_single_line_json() {
+        let root = std::env::temp_dir().join(format!(
+            "quickloop-telemetry-{}-{}",
+            std::process::id(),
+            line!() as u64
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        crate::testutil::with_cwd(&root, || {
+            let record = RunRecord {
+                pr: 42,
+                iteration: 2,
+                score: 100,
+                blocked: false,
+                dry_run: false,
+                commit_sha: "abc123".to_string(),
+                comment_url: Some("https://github.com/x/y/pull/42#issuecomment-1".to_string()),
+                committed: true,
+                verify_wall_s: 0.12,
+                publish_wall_s: 1.5,
+            };
+            let path = record_run(&record).expect("record_run must succeed");
+            let data = fs::read_to_string(&path).unwrap();
+            assert!(data.contains("\"pr\":42"));
+            assert!(data.contains("\"score\":100"));
+            assert!(data.contains("\"verify_wall_s\":0.12"));
+            assert!(!data.contains('\n'), "telemetry JSON must stay compact");
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dry_run_records_omit_comment_url() {
+        let record = RunRecord {
+            pr: 7,
+            iteration: 0,
+            score: 100,
+            blocked: false,
+            dry_run: true,
+            commit_sha: "deadbee".to_string(),
+            comment_url: None,
+            committed: false,
+            verify_wall_s: 0.1,
+            publish_wall_s: 0.2,
         };
-        let s = serde_json::to_string(&m).expect("metrics should serialize");
-        assert!(s.contains("\"ttft_s\":0.1"));
-        assert!(s.contains("\"cache_hit_rate\":0.85"));
+        let data = serde_json::to_string(&record).unwrap();
         assert!(
-            !s.contains("queue_time_s"),
+            !data.contains("comment_url"),
             "absent optional field must be skipped"
         );
-        assert!(!s.contains('\n'), "telemetry JSON must stay compact");
+        assert!(data.contains("\"dry_run\":true"));
     }
 }

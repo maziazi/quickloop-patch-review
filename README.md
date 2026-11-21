@@ -30,3 +30,32 @@ Comment-only AI reviewers relocate the merge bottleneck instead of removing it: 
        ├─ quickloop patch     → atomic single-match apply (any mismatch aborts set)
        ├─ quickloop verify    → concurrent test + lint + security + scope → score (0..100)
        └─ score == 100 ? publish & READY_TO_MERGE : replace failure tail & retry
+```
+
+**Deterministic gate:** `score = 40·S_test + 30·S_lint + 20·S_sec + 10·S_scope` (all binary).
+`READY_TO_MERGE` comes only from `quickloop verify` returning 100 — never model text.
+Protected test files are anti-cheat guarded: touching them reverts the patch and halts `BLOCKED`.
+
+## Quick Start
+
+```bash
+# 1. Build and install the worker
+cargo install --path worker
+quickloop --version
+
+# 2. Configure OpenClaw (merge the template; key comes from CEREBRAS_API_KEY)
+cp .env.example .env            # then fill in CEREBRAS_API_KEY (never commit .env)
+# merge config/openclaw.example.json5 into ~/.openclaw/openclaw.json
+
+# 3. Install the skills
+cp -r skills/* ~/.openclaw/skills/
+
+# 4. Run the closed loop against a PR (inside the target repo checkout)
+/looping-code-review 42
+
+# Worker commands are usable standalone:
+quickloop diff 42                        # filtered diff JSON + loop baseline
+quickloop patch out.patch                # atomic SEARCH/REPLACE apply (exit 2 on reject)
+quickloop verify                         # deterministic gate, always exit 0
+quickloop publish 42 --dry-run           # gate re-check only, zero remote writes
+```

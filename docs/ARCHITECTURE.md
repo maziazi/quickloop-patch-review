@@ -384,11 +384,13 @@ quickloop-patch-review/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs                # CLI entrypoint (`diff`, `patch`, `verify`, `publish`)
-│       ├── diff.rs                # PR diff extraction & noise filtering
+│       ├── diff.rs                # PR diff extraction & noise filtering + loop baseline
 │       ├── patch.rs               # Atomic SEARCH/REPLACE parser & applier
 │       ├── verify.rs              # Concurrent test/lint/sec/scope runner & scorer
-│       ├── publish.rs             # Git commit/push & idempotent PR comment upsert
-│       └── telemetry.rs           # API usage parser & monotonic clock recorder
+│       ├── publish.rs             # Gate re-check, commit/push & idempotent PR comment upsert
+│       ├── telemetry.rs           # Worker-measured run records (.quickloop/run-<pr>.json)
+│       ├── gh.rs                  # Fixed-args `gh` CLI wrapper (no shell composition)
+│       └── git.rs                 # Fixed-args `git` CLI wrapper (no shell composition)
 ├── demo-repo/                     # Reproducible target repo with planted bugs & MINOR nit
 └── bench/                         # Baseline suite (BL-01..BL-05) & TPS Bounty artifacts
 ```

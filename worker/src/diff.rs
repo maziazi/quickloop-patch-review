@@ -96,6 +96,18 @@ fn validate_pr_ref(pr_ref: &str) -> Result<(), String> {
     ))
 }
 
+/// Extract the numeric PR id from a validated PR reference.
+pub(crate) fn pr_number(pr_ref: &str) -> Result<u64, String> {
+    validate_pr_ref(pr_ref)?;
+    let digits = pr_ref
+        .strip_prefix('#')
+        .unwrap_or_else(|| pr_ref.rsplit("/pull/").next().unwrap_or(pr_ref));
+    let digits = digits.trim_end_matches(|c: char| !c.is_ascii_digit());
+    digits
+        .parse::<u64>()
+        .map_err(|e| format!("cannot derive PR number from '{pr_ref}': {e}"))
+}
+
 /// Execute `quickloop diff <pr>`.
 pub fn run(pr_ref: &str) -> Result<(), String> {
     validate_pr_ref(pr_ref)?;
