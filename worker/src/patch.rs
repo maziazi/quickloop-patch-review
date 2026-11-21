@@ -220,20 +220,9 @@ fn parse_blocks(text: &str) -> Result<Vec<Block>, String> {
 #[cfg(test)]
 mod tests {
     use super::{confinement_violation, parse_blocks, run};
+    use crate::testutil::with_cwd;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
-
-    /// `set_current_dir` is process-global, so CWD-dependent tests serialize
-    /// on this lock and restore the original directory afterwards.
-    fn with_cwd<F: FnOnce()>(root: &Path, f: F) {
-        static CWD_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = CWD_LOCK.lock().unwrap();
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(root).unwrap();
-        f();
-        std::env::set_current_dir(original).unwrap();
-    }
 
     #[test]
     fn parses_fenced_blocks_with_path_attribute() {

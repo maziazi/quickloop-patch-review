@@ -12,7 +12,7 @@ description: Closed-loop orchestrator — diff, review, patch, verify until the 
    a. Phase 3 patch synthesis (`receiving-code-review`) for the `CRITICAL` findings.
    b. `quickloop patch <file>` — atomic apply; any rejection aborts the whole set (exit 2).
    c. `quickloop verify` — it always exits 0; a score below 100 is loop data, not a crash.
-   d. `score == 100` → `quickloop publish <pr>`. Otherwise REPLACE the failure tail with the latest verify output and retry — never append history.
+   d. `score == 100` → `quickloop publish <pr> --iteration <n>` (pass `--dry-run` instead when the caller asked for zero remote writes). Publish re-runs the deterministic gate itself and refuses unverified state; otherwise REPLACE the failure tail with the latest verify output and retry — never append history.
 4. Gate decisions in strict priority: `BLOCKED` (`S_scope == 0` or verifier crash) > `NEEDS_HUMAN` (iteration ceiling or `ARCHITECTURAL`) > `READY_TO_MERGE` (`score == 100`).
 
 ## Hard rules

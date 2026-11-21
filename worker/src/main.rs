@@ -42,6 +42,12 @@ enum Command {
     Publish {
         /// PR number, `#N`, or full PR URL.
         pr: String,
+        /// Re-check the gate only — zero remote writes, no commit, no comment.
+        #[arg(long)]
+        dry_run: bool,
+        /// Loop iteration number recorded in the commit trailer and telemetry.
+        #[arg(long, default_value_t = 0)]
+        iteration: u32,
     },
 }
 
@@ -51,7 +57,11 @@ fn main() {
         Command::Diff { pr } => diff::run(&pr).map(|_| 0),
         Command::Patch { file } => patch::run(&file).map(|outcome| outcome.exit_code()),
         Command::Verify => verify::run().map(|_| 0),
-        Command::Publish { pr } => publish::run(&pr).map(|_| 0),
+        Command::Publish {
+            pr,
+            dry_run,
+            iteration,
+        } => publish::run(&pr, dry_run, iteration).map(|_| 0),
     };
     match code {
         Ok(0) => {}
@@ -76,10 +86,43 @@ mod tests {
         Cli::try_parse_from(["quickloop", "patch", "out.patch"]).expect("patch should parse");
         Cli::try_parse_from(["quickloop", "verify"]).expect("verify should parse");
         Cli::try_parse_from(["quickloop", "publish", "#42"]).expect("publish should parse");
+        Cli::try_parse_from(["quickloop", "publish", "42", "--dry-run"])
+            .expect("publish --dry-run");
+        Cli::try_parse_from(["quickloop", "publish", "42", "--iteration", "3"])
+            .expect("publish --iteration");
     }
 
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+}
+
+/// Test-only helper shared by every module that runs git fixtures: tests
+/// execute in parallel threads of ONE process, and `set_current_dir` is
+/// process-global — a single shared lock is what makes the fixtures safe.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn with_cwd<F: FnOnce()>(root: &Path, f: F) {
+        let lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(root).unwrap();
+        let _restore = CwdRestore(original);
+        f();
+        drop(_restore);
+        drop(lock);
+    }
+
+    struct CwdRestore(PathBuf);
+
+    impl Drop for CwdRestore {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
     }
 }
