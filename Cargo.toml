@@ -2,6 +2,7 @@
 resolver = "2"
 members = ["worker", "demo-repo"]
 # Bare `cargo test`/`cargo build` at the root target the worker only;
-# demo-repo's planted-bug tests stay red by design and are exercised via
-# `cargo test --workspace` or an explicit `-p demo-repo`.
+# `cargo test --workspace` (or an explicit `-p demo-repo`) additionally
+# exercises demo-repo, which is clean on `main` and red-by-design on the
+# `demo/planted-bugs` PR that the QuickLoop loop fixes.
 default-members = ["worker"]
