@@ -298,7 +298,7 @@ fn status_changed_fields(raw: &str) -> Vec<String> {
     paths
 }
 
-fn read_baseline() -> Result<Baseline, String> {
+pub(crate) fn read_baseline() -> Result<Baseline, String> {
     let data = fs::read_to_string(Path::new(".quickloop").join("baseline.json"))
         .map_err(|_| "no baseline found — run `quickloop diff <pr>` first".to_string())?;
     serde_json::from_str(&data).map_err(|e| format!("corrupt baseline.json: {e}"))

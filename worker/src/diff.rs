@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::gh;
+use crate::git;
 use crate::verify::is_protected_path;
 
 /// File names always stripped from the diff before it reaches the model.
@@ -102,7 +103,11 @@ pub(crate) fn pr_number(pr_ref: &str) -> Result<u64, String> {
     let digits = pr_ref
         .strip_prefix('#')
         .unwrap_or_else(|| pr_ref.rsplit("/pull/").next().unwrap_or(pr_ref));
-    let digits = digits.trim_end_matches(|c: char| !c.is_ascii_digit());
+    let digits = digits
+        .split('#')
+        .next()
+        .unwrap_or(digits)
+        .trim_end_matches('/');
     digits
         .parse::<u64>()
         .map_err(|e| format!("cannot derive PR number from '{pr_ref}': {e}"))
@@ -111,6 +116,8 @@ pub(crate) fn pr_number(pr_ref: &str) -> Result<u64, String> {
 /// Execute `quickloop diff <pr>`.
 pub fn run(pr_ref: &str) -> Result<(), String> {
     validate_pr_ref(pr_ref)?;
+    // Runtime artifacts must never leak into the user's repository.
+    git::ensure_local_exclude(".quickloop/")?;
     let meta = gh::run(&[
         "pr",
         "view",
@@ -462,6 +469,30 @@ Binary files a/assets/logo.png and b/assets/logo.png differ
             "gh flag injection must be rejected"
         );
         assert!(validate_pr_ref("https://example.com/pull/1").is_err());
+    }
+
+    #[test]
+    fn pr_number_extracts_ids_from_every_reference_form() {
+        assert_eq!(super::pr_number("42").unwrap(), 42);
+        assert_eq!(super::pr_number("#42").unwrap(), 42);
+        assert_eq!(
+            super::pr_number("https://github.com/maziazi/quickloop-patch-review/pull/42").unwrap(),
+            42
+        );
+        assert_eq!(
+            super::pr_number("https://github.com/maziazi/quickloop-patch-review/pull/42/").unwrap(),
+            42,
+            "trailing slash"
+        );
+        assert_eq!(
+            super::pr_number(
+                "https://github.com/maziazi/quickloop-patch-review/pull/42#issuecomment-1"
+            )
+            .unwrap(),
+            42,
+            "URL fragments are dropped"
+        );
+        assert!(super::pr_number("abc").is_err());
     }
 
     #[test]

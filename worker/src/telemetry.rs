@@ -29,6 +29,10 @@ pub struct RunRecord {
     pub verify_wall_s: f64,
     /// Wall-clock seconds for the whole publish invocation.
     pub publish_wall_s: f64,
+    /// Failure reason when the publish did not complete (SPEC FR-6:
+    /// telemetry is emitted even on failure).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Persist the run record; returns the file it was written to.
@@ -67,6 +71,7 @@ mod tests {
                 committed: true,
                 verify_wall_s: 0.12,
                 publish_wall_s: 1.5,
+                error: None,
             };
             let path = record_run(&record).expect("record_run must succeed");
             let data = fs::read_to_string(&path).unwrap();
@@ -91,6 +96,7 @@ mod tests {
             committed: false,
             verify_wall_s: 0.1,
             publish_wall_s: 0.2,
+            error: None,
         };
         let data = serde_json::to_string(&record).unwrap();
         assert!(
