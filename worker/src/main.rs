@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 mod diff;
 mod gh;
+mod git;
 mod patch;
 mod publish;
 mod telemetry;
