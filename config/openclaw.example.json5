@@ -1,0 +1,34 @@
+// QuickLoop — OpenClaw control-plane template.
+// Merge into ~/.openclaw/openclaw.json (JSON5). Never put a real API key in
+// this repository file; the key is read from the CEREBRAS_API_KEY env var.
+{
+  // Cerebras provider. Per hackathon rules, trial-key execution must run
+  // through the OpenClaw harness.
+  provider: {
+    baseUrl: "https://api.cerebras.ai/v1",
+    apiKeyEnv: "CEREBRAS_API_KEY",
+    // Verified trial model. Do NOT change to `-test` (returns HTTP 404).
+    model: "moonshotai-kimi-k3.1-pro-trial",
+    // Offline rehearsal fallback (config only): "gpt-oss-120b".
+    limits: {
+      contextTokens: 262144,
+      maxOutputTokens: 40960,
+      requestsPerMin: 1000,
+      totalTokensPerMin: 1000000,
+      uncachedTokensPerMin: 100000,
+    },
+  },
+
+  // Speed levers (docs/DESIGN.md §2): reasoning paid once in Phase 2 only.
+  inference: {
+    stream: true,
+    review: { maxTokens: 1500, reasoningEffort: "low" }, // Phase 2
+    patch: { maxTokens: 800, reasoningEffort: "off" },   // Phase 3
+  },
+
+  // Tool policy pinning + session pruning (cache-preservation rules).
+  tools: {
+    policy: ["exec", "read"],
+    pruneSupersededLogs: true,
+  },
+}

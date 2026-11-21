@@ -1,0 +1,8 @@
+[package]
+name = "demo-repo"
+version = "0.1.0"
+edition = "2021"
+description = "Demo target repository with planted CRITICAL bugs and a MINOR nit for QuickLoop end-to-end verification"
+publish = false
+
+[dependencies]

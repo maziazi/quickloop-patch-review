@@ -1,0 +1,64 @@
+# --- Local AI Coding Agent Instructions (Keep Local Only) ---
+AGENTS.md
+CLAUDE.md
+.claude/
+.zcode/
+.cursor/
+.aider*
+
+# --- Stray scratch markdown at repo root (Keep Local Only) ---
+# Ignores non-essential top-level notes (GOAL.md, NOTES.md, TODO.md, ...).
+# Core repo docs stay tracked; docs/ is unaffected (pattern is root-anchored).
+/*.md
+!README.md
+!CONTRIBUTING.md
+
+# --- Secrets & Environment Variables ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+credentials*.json
+openclaw.local.json*
+
+# --- QuickLoop Runtime & Telemetry Artifacts ---
+.quickloop/
+.loopr/
+*.log
+bench/raw-runs/
+
+# --- Rust (Worker CLI) ---
+target/
+**/*.rs.bk
+*.pdb
+# Note: Cargo.lock files are intentionally tracked (binary crates; reproducible builds).
+
+# --- Node / JS / TS (OpenClaw skills or scripts) ---
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+dist/
+build/
+.cache/
+
+# --- Python (bench scripts) ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# --- OS & Editor / IDE ---
+.DS_Store
+.AppleDouble
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
