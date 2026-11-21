@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod diff;
+mod gh;
 mod patch;
 mod publish;
 mod telemetry;
@@ -45,17 +46,21 @@ enum Command {
 
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Diff { pr } => diff::run(&pr),
-        Command::Patch { file } => patch::run(&file),
-        Command::Verify => verify::run(),
-        Command::Publish { pr } => publish::run(&pr),
+    let code = match cli.command {
+        Command::Diff { pr } => diff::run(&pr).map(|_| 0),
+        Command::Patch { file } => patch::run(&file).map(|outcome| outcome.exit_code()),
+        Command::Verify => verify::run().map(|_| 0),
+        Command::Publish { pr } => publish::run(&pr).map(|_| 0),
     };
-    if let Err(err) = result {
-        // Worker execution failures exit non-zero on stderr; compact JSON on
-        // stdout is reserved for structured loop data.
-        eprintln!("quickloop: {err}");
-        std::process::exit(1);
+    match code {
+        Ok(0) => {}
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            // Worker execution failures exit non-zero on stderr; compact JSON
+            // on stdout is reserved for structured loop data.
+            eprintln!("quickloop: {err}");
+            std::process::exit(1);
+        }
     }
 }
 
