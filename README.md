@@ -41,7 +41,7 @@
 
 > **Summary:** Comment-only AI code reviewers leave the slowest part of a Pull Request—editing files, re-running tests, and verifying scope—entirely manual. **QuickLoop** closes the loop autonomously inside OpenClaw, emitting minimal `SEARCH/REPLACE` patches at wafer-scale decode speed and enforcing a deterministic Rust merge gate (`score == 100`) with structural anti-cheat protection (`S_scope`).
 
-> ⚠️ **Pre-release.** Measured figures below (`TBD`) will be filled from real Cerebras API runs once the acceptance criteria in [`docs/SPEC.md`](./docs/SPEC.md) pass.
+> **Measured 2026-11-22** on the shared trial endpoint via OpenClaw 2026.10.9 (model `moonshotai-kimi-k3.1-pro-trial`, reasoning OFF; see [`bench/tps-bounty.md`](./bench/tps-bounty.md) for methodology and raw evidence). Columns marked *n/a†* are not surfaced by the harness CLI yet (Roadmap item: wire API `time_info`) — reported absent, never estimated.
 
 ---
 
@@ -99,11 +99,11 @@ Every performance figure in this repository is recorded directly from Cerebras A
 
 | Component | Target | Measured (Median) | Notes |
 | :--- | :--- | :--- | :--- |
-| Rust worker cold start (`quickloop --version`) | `< 15 ms` | `TBD ms` | Minimal dependencies (`clap`, `serde`, `std::process::Command`) |
-| Diff extraction and noise filtering (`quickloop diff`) | `< 400 ms` | `TBD ms` | Strips lockfiles, `dist/`, `vendor/`, and binary diffs |
-| Concurrent 4-check gate (`quickloop verify`) | `< 300 ms` | `TBD ms` | Scope pre-check, then concurrent `test`/`lint`/`sec` subprocesses |
-| Prefix cache hit rate (Iteration >= 2) | `> 80%` | `TBD %` | Keeps usage well inside the `100K` uncached TPM ceiling |
-| Full 3-iteration closed loop (`wall_s`) | `< 10 s` (`< 15 s` gate) | `TBD s` | Excludes external queue spikes (logged via `queue_time_s`) |
+| Rust worker cold start (`quickloop --version`) | `< 15 ms` | **`4.4 ms`** (50-run mean incl. fork overhead) | Minimal dependencies (`clap`, `serde`, `std::process::Command`) |
+| Diff extraction and noise filtering (`quickloop diff`) | `< 400 ms` | **`2.43 s`** incl. 2 `gh` API round-trips (local parse ≈ ms) | Strips lockfiles, `dist/`, `vendor/`, and binary diffs |
+| Concurrent 4-check gate (`quickloop verify`) | `< 300 ms` | **`2.60 s`** (official loop; `cargo --workspace` dominates — scans are ms-scale) | Scope pre-check, then concurrent `test`/`lint`/`sec` subprocesses |
+| Prefix cache hit rate (Iteration >= 2) | `> 80%` | **`91.8%`** (189,440 cache-read tokens) | Keeps usage well inside the `100K` uncached TPM ceiling |
+| Full closed loop (`wall_s`) | `< 10 s` (`< 15 s` gate) | **worker gates `12.1 s`** (verify 2.60 + publish 9.53); agent turn 440 s incl. shared-endpoint backoff | Endpoint-queue-bound; iteration count depends on findings |
 
 ### Visual Proof: Throughput and Run-to-Run Consistency
 
@@ -119,20 +119,19 @@ Every performance figure in this repository is recorded directly from Cerebras A
 
 | Suite | Scenario | Cache State | `queue_time_s` (Med) | `ttft_s` (Med) | `output_tps` (Med / Min–Max) | `e2e_tps` (Med) | `cache_hit_rate` |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **BL-01** | Sanity short reply (`< 500` in -> `100–150` out) | Cold / Warm | `TBD` | `TBD` | `TBD` (`TBD–TBD`) | `TBD` | `TBD` |
-| **BL-02** | Medium code generation (`1K–4K` in -> `800–1.2K` out) | Warm | `TBD` | `TBD` | `TBD` (`TBD–TBD`) | `TBD` | `TBD` |
-| **BL-03** | Single-step repo diff and `SEARCH/REPLACE` patch | Warm | `TBD` | `TBD` | `TBD` (`TBD–TBD`) | `TBD` | `TBD` |
-| **BL-04** | Multi-step loop (>= 3 turns, replaced failure tail) | Cold -> Warm | `TBD` | `TBD` | `TBD` (`TBD–TBD`) | `TBD` | `> 80% (TBD)` |
-| **BL-05** | Disjoint parallel fan-out (`concurrency = 2–4`) | Warm | `TBD` | `TBD` | `TBD` (`TBD–TBD`) | `TBD` | `TBD` |
+| **BL-01** | Sanity short reply (16 chars out) | Warm | n/a† | n/a† | n/a† | **15.05 s** (12.86–15.36) | — |
+| **BL-02** | Medium code generation (~2.1 KB Rust out) | Warm | n/a† | n/a† | n/a† | **20.95 s** (20.67–26.46) | — |
+| **BL-03** | Single-step `SEARCH/REPLACE` patch block (105 chars) | Warm | n/a† | n/a† | n/a† | **7.58 s** | — |
+| **BL-04** | Multi-step loop (official PR #5 run) | Cold -> Warm | n/a† | n/a† | n/a† | turn 440 s incl. endpoint backoff; worker gates 2.60 / 9.53 s | **91.8%** (189,440 tokens) |
+| **BL-05** | Disjoint parallel fan-out (`concurrency = 4`) | Warm | n/a† | n/a† | n/a† | **9.61 s** (9.57–9.73, 160 ms spread) | — |
 
 ### Sample Run Output (`demo-repo/` PR #5)
 
 ```text
 QuickLoop · PR #5 · READY_TO_MERGE
   iterations        3  (iter 0 review: cold · iter 1–2 patch: warm cache)
-  wall clock        TBD s
-  inference         TBD s   (output TBD tok/s · e2e TBD tok/s · TTFT TBD s · queue TBD s)
-  tokens            in TBD (cached TBD · TBD%) · out TBD
+  wall clock        440 s end-to-end incl. shared-endpoint backoff · worker gates 12.1 s
+  tokens            in 16,995 (cached read 189,440 · 91.8%) · out 3,901 · reasoning 1,629
   checks            tests PASS · lint clean · security clean · scope ok (score 100/100)
   preserved nits    1 MINOR finding reported in PR comment (untouched)
 ```
