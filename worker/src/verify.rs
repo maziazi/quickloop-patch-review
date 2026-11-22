@@ -198,6 +198,16 @@ fn cargo_scope_args(changed: &[String]) -> Vec<String> {
     if members.is_empty() {
         return vec!["--workspace".to_string()];
     }
+    // Glob members (`crates/*`) expand beyond their literal directory text:
+    // a file under a glob-expanded sibling package would prefix-match the
+    // glob's root member (e.g. `a/b/src` matches member `a`), silently
+    // scoping the gate away from the real crate. Unparsable → fallback.
+    if members
+        .iter()
+        .any(|m| m.contains('*') || m.contains('?') || m.contains('['))
+    {
+        return vec!["--workspace".to_string()];
+    }
     let mut packages = Vec::new();
     // Deterministic order: walk members as listed in the manifest.
     for member in &members {
@@ -288,10 +298,17 @@ fn push_member(item: &str, members: &mut Vec<String>) {
 /// gate forever).
 fn package_name(member_dir: &Path) -> Option<String> {
     let manifest = fs::read_to_string(member_dir.join("Cargo.toml")).ok()?;
+    let mut section = String::new();
     for line in manifest.lines() {
         let line = line.trim();
-        if line == "[dependencies]" || line == "[dev-dependencies]" {
-            break;
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_string();
+            continue;
+        }
+        if section != "package" {
+            // Only `[package] name` is the crate's identity — a `[lib] name`
+            // or dependency key is a different thing entirely.
+            continue;
         }
         let Some(rest) = line
             .strip_prefix("name = ")
@@ -816,6 +833,38 @@ mod tests {
                     "src/lib.rs".to_string(),
                     "crates/sub/src/lib.rs".to_string()
                 ]),
+                ["--workspace"]
+            );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_scope_glob_member_rooted_at_literal_member_falls_back() {
+        // `members = ["a", "a/*"]`: a file under the glob-expanded sibling
+        // `a/b` prefix-matches the literal member `a`, so the completeness
+        // rule alone would wrongly scope the gate to `a`'s package while a
+        // regression in `a/b`'s package escapes. Glob metacharacters must
+        // force the `--workspace` fallback outright.
+        let root =
+            std::env::temp_dir().join(format!("quickloop-scope-glob-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a/src")).unwrap();
+        fs::create_dir_all(root.join("a/b/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"a/*\"]\n",
+        )
+        .unwrap();
+        fs::write(root.join("a/Cargo.toml"), "[package]\nname = \"apa\"\n").unwrap();
+        fs::write(root.join("a/b/Cargo.toml"), "[package]\nname = \"bee\"\n").unwrap();
+        with_cwd(&root, || {
+            assert_eq!(
+                cargo_scope_args(&["a/b/src/lib.rs".to_string()]),
+                ["--workspace"]
+            );
+            assert_eq!(
+                cargo_scope_args(&["a/src/lib.rs".to_string()]),
                 ["--workspace"]
             );
         });
