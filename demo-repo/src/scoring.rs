@@ -1,10 +1,10 @@
 // Planted CRITICAL (logic): the deployed config shipped a zero divisor, so
 // any call to `decayed_score` panics with "attempt to divide by zero".
 // The correct divisor is 30.
-const DECAY_DIVISOR_STR: &str = "0";
+const DECAY_DIVISOR_STR: &str = "30";
 
 fn decay_divisor() -> u32 {
-    DECAY_DIVISOR_STR.parse().unwrap_or(0)
+    DECAY_DIVISOR_STR.parse().unwrap_or(30)
 }
 
 /// Decay a raw score by the age of the associated finding, in days.
