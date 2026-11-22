@@ -100,10 +100,10 @@ Every performance figure in this repository comes from real runs — Cerebras AP
 | Component | Target | Measured (Median / Mean) | Notes |
 | :--- | :--- | :--- | :--- |
 | Rust worker cold start (`quickloop --version`) | `< 15 ms` | **`4.4 ms`** (50-run mean incl. fork overhead) | Minimal dependencies (`clap`, `serde`, `std::process::Command`) |
-| Diff extraction and noise filtering (`quickloop diff`) | `< 400 ms` | **`2.43 s`** incl. 2 `gh` API round-trips (local parse ≈ ms) | Strips lockfiles, `dist/`, `vendor/`, and binary diffs |
-| Concurrent 4-check gate (`quickloop verify`) | `< 300 ms` | **`2.60 s`** (official loop; `cargo --workspace` dominates — scans are ms-scale) | Scope pre-check, then concurrent `test`/`lint`/`sec` subprocesses |
+| Diff extraction and noise filtering (`quickloop diff`) | `< 400 ms` | **`1.5–1.9 s`** (parallel `gh` calls; network-bound) | Strips lockfiles, `dist/`, `vendor/`, and binary diffs |
+| Concurrent 4-check gate (`quickloop verify`) | `< 300 ms` | **`0.345 s`** warm (crate-scoped `-p`); `2.22 s` cold | Scope pre-check, then concurrent `test`/`lint`/`sec` subprocesses |
 | Prefix cache hit rate (Iteration >= 2) | `> 80%` | **`91.8%`** (189,440 cache-read tokens) | Keeps usage well inside the `100K` uncached TPM ceiling |
-| Full closed loop (`wall_s`) | `< 10 s` (`< 15 s` gate) | **worker gates `12.1 s`** (verify 2.60 + publish 9.53); agent turn 440 s incl. shared-endpoint backoff | Endpoint-queue-bound; iteration count depends on findings |
+| Full closed loop (`wall_s`) | `< 10 s` (`< 15 s` gate) | **worker gates `~9.9 s`** warm (verify 0.345 + publish 9.53); agent turn 440 s incl. shared-endpoint backoff | Endpoint-queue-bound; iteration count depends on findings |
 
 ### Visual Proof: Throughput and Run-to-Run Consistency
 
@@ -132,7 +132,7 @@ Every performance figure in this repository comes from real runs — Cerebras AP
 ```text
 QuickLoop · PR #5 · READY_TO_MERGE
   iterations        1  (verify 100 on the first gate pass; `QuickLoop-Iteration: 1`)
-  wall clock        440 s end-to-end incl. shared-endpoint backoff · worker gates 12.1 s
+  wall clock        440 s end-to-end incl. shared-endpoint backoff · worker gates ~9.9 s warm
   tokens            in 16,995 (cached read 189,440 · 91.8%) · out 3,901 · reasoning 1,629
   checks            tests PASS · lint clean · security clean · scope ok (score 100/100)
   preserved nits    1 MINOR finding reported in PR comment (untouched)
