@@ -20,7 +20,7 @@ Designing for speed requires aligning the harness with the underlying hardware a
 ## 2. Speed Levers (Ordered by Impact)
 1. **Byte-stable prompt prefix `[V]`:** Keep static `SKILL.md` rules, pinned tool schemas (`exec`, `read`), and filtered diff immutable at the top. Cached tokens cut TTFT and do not consume the **100K uncached TPM** ceiling. Assert `cached_tokens > 0` on iteration 2; treat `< 80%` hit rate as a defect.
 2. **Minimal `SEARCH/REPLACE` patches `[U]`:** ~400 output tokens vs ~5,000 for whole-file rewrites. Cap `max_tokens` (review `1,500`, patch `800`). Forbid prose outside patch fences.
-3. **Asymmetric reasoning dial `[V]`:** `reasoning_effort: low` once in Phase 0 review; **OFF** (unset) during patch synthesis.
+3. **Asymmetric reasoning dial `[V]`:** `reasoning_effort: low` once in Phase 2 review; **OFF** (unset) during patch synthesis.
 4. **Replaceable dynamic tail `[U]`:** `failing_evidence` overwrites the previous iteration's failure output instead of appending, preventing linear KV-cache growth in DSA layers.
 5. **Tool policy pinning & session pruning `[V]`:** Restrict OpenClaw tools to `exec` + `read`; prune superseded tool logs between turns.
 6. **Streaming & payload compression `[V]`:** Enable `stream: true` and `msgpack + gzip` when supported by client.

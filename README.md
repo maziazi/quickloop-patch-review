@@ -54,7 +54,7 @@ GitHub automatically renders an inline native video player.
 
 <div align="center">
 
-https://github.com/user-attachments/assets/REPLACE_WITH_YOUR_DEMO_VIDEO_ID
+`https://github.com/user-attachments/assets/REPLACE_WITH_YOUR_DEMO_VIDEO_ID`
 
 <!--
 OPTION B (If hosted externally): Replace Option A with a linked preview image:
@@ -63,7 +63,7 @@ OPTION B (If hosted externally): Replace Option A with a linked preview image:
 </a>
 -->
 
-<sub><b>60-second real-time run</b> on <code>demo-repo/</code> (PR #5): triaging <code>CRITICAL</code> defects, preserving the <code>MINOR</code> naming finding, verifying <code>score == 100</code>, demonstrating anti-cheat <code>BLOCKED</code> enforcement on test deletion, and publishing API-sourced telemetry.</sub>
+<sub><b>60-second real-time run</b> on <code>demo-repo/</code> — this repository's live demo PR #5: triaging <code>CRITICAL</code> defects, preserving the <code>MINOR</code> naming finding, verifying <code>score == 100</code>, demonstrating anti-cheat <code>BLOCKED</code> enforcement on test deletion, and publishing API-sourced telemetry.</sub>
 
 </div>
 
@@ -84,7 +84,7 @@ OPTION B (If hosted externally): Replace Option A with a linked preview image:
 
 ## Benchmarks and Honest TPS Telemetry
 
-Every performance figure in this repository is recorded directly from Cerebras API `usage` / `time_info` fields and local monotonic clocks into `.quickloop/run-<id>.json`—never estimated with a local tokenizer. Server queueing (`queue_time_s`), pure decode rate (`output_tps`), and caller-experienced throughput (`e2e_tps`) are reported separately across **3–5 repeated runs** to demonstrate both speed and run-to-run consistency.
+Every performance figure in this repository is recorded directly from Cerebras API `usage` / `time_info` fields and local monotonic clocks — persisted to `.quickloop/run-<pr>.json` as the harness integration lands — never estimated with a local tokenizer. Server queueing (`queue_time_s`), pure decode rate (`output_tps`), and caller-experienced throughput (`e2e_tps`) are reported separately across **3–5 repeated runs** to demonstrate both speed and run-to-run consistency.
 
 ### Engineering Targets vs. Measured Hardware and Worker Overhead
 
@@ -92,19 +92,21 @@ Every performance figure in this repository is recorded directly from Cerebras A
 | :--- | :--- | :--- | :--- |
 | Rust worker cold start (`quickloop --version`) | `< 15 ms` | `TBD ms` | Minimal dependencies (`clap`, `serde`, `std::process::Command`) |
 | Diff extraction and noise filtering (`quickloop diff`) | `< 400 ms` | `TBD ms` | Strips lockfiles, `dist/`, `vendor/`, and binary diffs |
-| Concurrent 4-check gate (`quickloop verify`) | `< 300 ms` | `TBD ms` | Runs `test`, `lint`, `sec`, and `scope` checks concurrently |
+| Concurrent 4-check gate (`quickloop verify`) | `< 300 ms` | `TBD ms` | Scope pre-check, then concurrent `test`/`lint`/`sec` subprocesses |
 | Prefix cache hit rate (Iteration >= 2) | `> 80%` | `TBD %` | Keeps usage well inside the `100K` uncached TPM ceiling |
 | Full 3-iteration closed loop (`wall_s`) | `< 10 s` (`< 15 s` gate) | `TBD s` | Excludes external queue spikes (logged via `queue_time_s`) |
 
 ### Visual Proof: Throughput and Run-to-Run Consistency
 
+<!-- PENDING ASSET: benchmark-tps.png — uncomment once real runs produce the chart.
 <div align="center">
   <img src="./docs/assets/benchmark-tps.png" alt="QuickLoop TPS and Latency Consistency Benchmark" width="90%" />
   <br />
   <sub><i>Measured across repeated runs on <code>moonshotai-kimi-k3.1-pro-trial</code> via OpenClaw and Cerebras WSE. See <a href="./bench/tps-bounty.md">bench/tps-bounty.md</a> for raw JSON logs and methodology.</i></sub>
 </div>
+-->
 
-### Baseline Suite (`BL-01`–`BL-05`) — Median and Consistency Range (N = 5 runs)
+### Baseline Suite (`BL-01`–`BL-05`) — Median and Consistency Range (N = 3–5 runs)
 
 | Suite | Scenario | Cache State | `queue_time_s` (Med) | `ttft_s` (Med) | `output_tps` (Med / Min–Max) | `e2e_tps` (Med) | `cache_hit_rate` |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -148,9 +150,11 @@ Full measurement definitions and formulas are documented in [`docs/DESIGN.md`](.
 
 QuickLoop executes a **5-phase bounded closed loop**: **Diff Intake -> Severity Triage -> Minimal Patch Synthesis -> Concurrent Verification and Anti-Cheat -> Idempotent Publish**.
 
+<!-- PENDING ASSET: workflow.svg — uncomment once exported.
 <div align="center">
   <img src="./docs/assets/workflow.svg" alt="QuickLoop Closed-Loop Workflow Diagram" width="95%" />
 </div>
+-->
 
 ### Deterministic Merge Gate and Anti-Cheat (`S_scope`)
 
@@ -168,9 +172,11 @@ $$\text{score} = 40 \cdot S_{\text{test}} + 30 \cdot S_{\text{lint}} + 20 \cdot 
 
 QuickLoop cleanly separates **LLM reasoning and patch synthesis** from **deterministic local execution and guardrails** across four architectural layers:
 
+<!-- PENDING ASSET: architecture.svg — uncomment once exported.
 <div align="center">
   <img src="./docs/assets/architecture.svg" alt="QuickLoop 4-Layer AI Architecture Diagram" width="95%" />
 </div>
+-->
 
 ### Speed and Hardware Alignment (Cerebras WSE + Kimi K3.1 Pro)
 
@@ -180,7 +186,7 @@ Latency optimization is aligned with the physical characteristics of `moonshotai
 | :--- | :--- | :--- |
 | **Byte-Stable Prompt Prefix** | Zero dynamic variables (counters, timestamps, UUIDs) above the tail | Sustains `> 80%` prefix caching; fits inside the `100K` uncached TPM ceiling |
 | **Minimal `SEARCH/REPLACE` Hunks** | Emits ~400 output tokens instead of ~5,000-token full-file rewrites | Cuts memory-bandwidth-bound decode duration by ~5–10x |
-| **Asymmetric Reasoning Dial** | `reasoning_effort: low` in Phase 0 review; **OFF** in patch phase | Eliminates redundant reasoning tokens on the hot patch path |
+| **Asymmetric Reasoning Dial** | `reasoning_effort: low` in Phase 2 review; **OFF** in Phase 3 patch synthesis | Eliminates redundant reasoning tokens on the hot patch path |
 | **Replaceable Failure Tail** | Overwrites prior `verify` failure output rather than appending | Prevents linear KV-cache bloat across Kimi's 24 DSA layers |
 | **Pinned Tool Policy + Rust CLI** | OpenClaw restricted to `exec` and `read`; `< 15 ms` native Rust binary | Zero unused tool schema overhead and sub-300 ms local verification |
 
@@ -191,7 +197,7 @@ See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) for the complete system spe
 ## Quick Start
 
 ### Prerequisites
-- **Rust 1.75+** (`cargo`)
+- **A recent stable Rust toolchain** (`cargo`)
 - **`git`** and **GitHub CLI (`gh`)** authenticated (`gh auth login`)
 - **OpenClaw CLI** (`npm i -g openclaw`), gateway running (`openclaw gateway start`)
 - **Cerebras API key** with access to `moonshotai-kimi-k3.1-pro-trial`
@@ -254,7 +260,7 @@ Setup notes that bite in practice:
 
 - **The gateway process must see `CEREBRAS_API_KEY`.** Export it in your shell profile, or append `export CEREBRAS_API_KEY=...` to `~/.openclaw/service-env/ai.openclaw.gateway.env`, then `openclaw gateway stop --force && openclaw gateway start`.
 - **Per-agent model overrides win over defaults.** If your agent pins an explicit `model` (e.g. `agents.entries.main.model`), pin the model per QuickLoop run: `openclaw agent --model cerebras/moonshotai-kimi-k3.1-pro-trial ...`.
-- **Thinking levels on the trial model are `off` and `ultra` only.** QuickLoop runs use `--thinking off` (reasoning OFF on the patch path — minimal output tokens).
+- **Thinking levels on the trial model are `off` and `ultra` only.** QuickLoop runs use `--thinking off` (session level); the review phase's `reasoning_effort: low` is issued per-phase by the skill protocol against the Cerebras API.
 - **The trial endpoint is shared:** HTTP 429 (`queue_exceeded`) is normal under load — wait and retry.
 - For offline rehearsal without calling the trial endpoint, switch the model id to `gpt-oss-120b` in configuration only.
 
@@ -273,16 +279,16 @@ Grant macOS **Full Disk Access** (chat database) and **Automation** permission (
 ### 4. Run on a Pull Request
 
 ```bash
-/requesting-code-review 5            # Review only — structured CRITICAL/MINOR/ARCHITECTURAL findings
-/receiving-code-review 5             # Synthesize and apply atomic SEARCH/REPLACE patches
-/looping-code-review 5               # Full closed loop until READY_TO_MERGE / NEEDS_HUMAN / BLOCKED
+/requesting-code-review 42            # Review only — structured CRITICAL/MINOR/ARCHITECTURAL findings
+/receiving-code-review 42             # Synthesize and apply atomic SEARCH/REPLACE patches
+/looping-code-review 42               # Full closed loop until READY_TO_MERGE / NEEDS_HUMAN / BLOCKED
 ```
 
 From a terminal (no chat channel needed), drive the same loop directly:
 
 ```bash
 openclaw agent --model cerebras/moonshotai-kimi-k3.1-pro-trial --thinking off \
-  -m "/looping-code-review 5"        # add --session-id <id> for a fresh session
+  -m "/looping-code-review 42"        # add --session-id <id> for a fresh session
 ```
 
 The publish step supports `quickloop publish <pr> --dry-run` (gate re-check only — zero remote push or comment) and is idempotent: re-running it upserts the single PR status comment instead of spamming.
@@ -299,7 +305,7 @@ quickloop-patch-review/
 ├── demo-repo/                     # Reproducible target repo with planted bugs and MINOR finding
 ├── bench/                         # Baseline suite (BL-01..BL-05) and TPS Bounty artifacts
 ├── docs/
-│   ├── assets/                    # Exported architecture/workflow diagrams and benchmark charts
+│   ├── assets/                    # Demo/diagram assets (pending)
 │   ├── ARCHITECTURE.md            # 4-layer AI architecture, pipeline deep-dive, and data contracts
 │   ├── SPEC.md                    # Functional/non-functional specs, gate, and acceptance criteria
 │   ├── DESIGN.md                  # Speed levers, Cerebras/Kimi physics, and token budget

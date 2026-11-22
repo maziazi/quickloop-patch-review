@@ -46,7 +46,7 @@ cp -r skills/* ~/.openclaw/skills/
    ```bash
    cp .env.example .env
    ```
-2. Merge [`config/openclaw.example.json5`](./config/openclaw.example.json5) into `~/.openclaw/openclaw.json`.
+2. Apply the provider template (validated single write; the key is read from `CEREBRAS_API_KEY` by name): `set -a && source .env && set +a && openclaw config patch --file config/openclaw.example.json5`.
 3. **Hackathon API Rule:** If you are using a hackathon trial key for `moonshotai-kimi-k3.1-pro-trial`, all requests must run through the **OpenClaw** harness. For offline rehearsal or when testing worker logic without hitting the trial endpoint, you may switch the model ID in config to `gpt-oss-120b`.
 
 ---

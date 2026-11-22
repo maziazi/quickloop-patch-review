@@ -372,7 +372,7 @@ quickloop-patch-review/
 │   ├── DESIGN.md                  # Speed levers, hardware physics, token budget, BL-01..BL-05
 │   └── PLAN.md                    # Hackathon schedule, scope-cut order, video plan
 ├── config/
-│   └── openclaw.example.json5     # Cerebras provider & restricted tool policy template
+│   └── openclaw.example.json5     # Cerebras provider template (SecretRef key ref + agent model default)
 ├── skills/
 │   ├── requesting-code-review/
 │   │   └── SKILL.md               # Phase 2 initial review & severity triage skill
