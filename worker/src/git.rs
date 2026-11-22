@@ -28,11 +28,17 @@ pub fn run(args: &[&str]) -> Result<String, String> {
 /// The location is resolved via `git rev-parse --git-common-dir` — `info/`
 /// is part of the *common* dir, so this also works from linked worktrees,
 /// where `.git` is a file pointing at a per-worktree directory and the
-/// shared exclude lives back in the main repository's `.git`.
+/// shared exclude lives back in the main repository's `.git`. Git may emit
+/// the dir cwd-relative (e.g. `.git` at the toplevel); that resolves
+/// against the caller's cwd, which is the worker's repo-root assumption
+/// documented in the skills contract.
 pub fn ensure_local_exclude(pattern: &str) -> Result<(), String> {
     let git_dir = run(&["rev-parse", "--git-common-dir"])
         .map_err(|e| format!("resolve git dir: {e} (is this a git repository?)"))?;
     let git_dir = git_dir.trim();
+    if git_dir.is_empty() {
+        return Err("git rev-parse --git-common-dir produced empty output".to_string());
+    }
     let exclude_path = Path::new(git_dir).join("info").join("exclude");
     fs::create_dir_all(exclude_path.parent().ok_or("git info path has no parent")?)
         .map_err(|e| format!("create git info dir: {e}"))?;

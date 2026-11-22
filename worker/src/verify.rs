@@ -179,11 +179,17 @@ fn score_of(checks: &Checks) -> u32 {
         + 10 * u32::from(checks.scope)
 }
 
-/// Cargo argument scope for the gate: `-p <pkg>` per workspace member whose
-/// directory intersects a changed path, or `--workspace` when nothing maps.
-/// Member directories come from the root `Cargo.toml`; package names from
-/// each member's own `[package] name`. Any parse trouble falls back to
-/// `--workspace` — scoping is an optimization, never a completeness risk.
+/// Cargo argument scope for the gate: `-p <pkg>` per workspace member,
+/// used **only when every changed path maps into some member directory**
+/// (completeness-driven). Member directories come from the root
+/// `Cargo.toml`; package names from each member's own `[package] name`.
+///
+/// This direction matters: any lossiness in the mapping — root-package
+/// worktrees (root files have no member dir), glob members, truncated
+/// trailing comments, unparsable names, root-level files like `README.md`
+/// or `Cargo.lock` — leaves a changed path unmapped and forces the
+/// `--workspace` fallback. Scoping is an optimization, never a
+/// completeness risk.
 fn cargo_scope_args(changed: &[String]) -> Vec<String> {
     let Ok(root_manifest) = fs::read_to_string("Cargo.toml") else {
         return vec!["--workspace".to_string()];
@@ -193,17 +199,31 @@ fn cargo_scope_args(changed: &[String]) -> Vec<String> {
         return vec!["--workspace".to_string()];
     }
     let mut packages = Vec::new();
-    for member in members {
-        let member_prefix = format!("{member}/");
-        if !changed.iter().any(|path| path.starts_with(&member_prefix)) {
+    // Deterministic order: walk members as listed in the manifest.
+    for member in &members {
+        if !changed
+            .iter()
+            .any(|path| path.starts_with(format!("{member}/").as_str()))
+        {
             continue;
         }
-        let Some(name) = package_name(Path::new(&member)) else {
+        let Some(name) = package_name(Path::new(member)) else {
             return vec!["--workspace".to_string()];
         };
-        packages.push(name);
+        if !packages.contains(&name) {
+            packages.push(name);
+        }
     }
-    if packages.is_empty() {
+    // Completeness rule: every changed path must have mapped into some
+    // member — any unmapped path (root package files, glob members,
+    // root-level files like README.md) forces the whole workspace so a
+    // regression can never escape a partial scope.
+    let all_mapped = changed.iter().all(|path| {
+        members
+            .iter()
+            .any(|m| path.starts_with(format!("{m}/").as_str()))
+    });
+    if !all_mapped || packages.is_empty() {
         return vec!["--workspace".to_string()];
     }
     let mut args = Vec::with_capacity(packages.len() * 2);
@@ -261,16 +281,26 @@ fn push_member(item: &str, members: &mut Vec<String>) {
 
 /// The `[package] name` of a member crate: the first `name = "..."` before
 /// any dependency section starts (package metadata always precedes deps).
+/// Strict: the value must be a clean quoted string (`split('"')` takes the
+/// text between the first two quotes, so a trailing `# comment` parses
+/// cleanly; exotic lines yield `None` → the caller falls back to
+/// `--workspace` instead of passing a garbage `-p` that would fail the
+/// gate forever).
 fn package_name(member_dir: &Path) -> Option<String> {
     let manifest = fs::read_to_string(member_dir.join("Cargo.toml")).ok()?;
     for line in manifest.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("name = ") {
-            return Some(rest.trim().trim_matches('"').to_string());
-        }
         if line == "[dependencies]" || line == "[dev-dependencies]" {
             break;
         }
+        let Some(rest) = line
+            .strip_prefix("name = ")
+            .or_else(|| line.strip_prefix("name="))
+        else {
+            continue;
+        };
+        let value = rest.split('"').nth(1).filter(|v| !v.is_empty())?;
+        return Some(value.to_string());
     }
     None
 }
@@ -695,9 +725,97 @@ mod tests {
                 ]),
                 ["-p", "quickloop", "-p", "demo_repo"]
             );
-            // Root-level file outside any member → whole workspace.
+            // Completeness rule: ANY changed path that maps to no member
+            // (root-level files, unmapped crates) forces the whole workspace —
+            // a regression in an unmapped file must never escape the gate.
             assert_eq!(
-                cargo_scope_args(&["README.md".to_string(), "Cargo.lock".to_string()]),
+                cargo_scope_args(&["demo-repo/src/auth.rs".to_string(), "README.md".to_string()]),
+                ["--workspace"]
+            );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_scope_lossy_manifests_fall_back_to_workspace() {
+        let root =
+            std::env::temp_dir().join(format!("quickloop-scope-lossy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("worker/src")).unwrap();
+        fs::create_dir_all(root.join("crates/extra/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            // Trailing inline comment on the members line: the naive parser
+            // would produce a garbage last member — the completeness rule
+            // must still force the fallback for unmapped paths.
+            "[workspace]\nmembers = [\"worker\", \"crates/extra\", \"demo-repo\"] # note\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("worker/Cargo.toml"),
+            // Trailing comment after the quoted name — strict parse → None.
+            "[package]\nname = \"quickloop\" # the cli\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/extra/Cargo.toml"),
+            "[package]\nname=\"extra_no_space\"\n",
+        )
+        .unwrap();
+        with_cwd(&root, || {
+            // worker maps cleanly, but demo-repo (with a comment-corrupted
+            // manifest entry) is unmapped → fallback, never a partial scope.
+            assert_eq!(
+                cargo_scope_args(&[
+                    "worker/src/main.rs".to_string(),
+                    "demo-repo/src/auth.rs".to_string()
+                ]),
+                ["--workspace"]
+            );
+            // worker alone: the trailing comment after the quoted name parses
+            // cleanly (split('"') takes the text between the quotes).
+            assert_eq!(
+                cargo_scope_args(&["worker/src/main.rs".to_string()]),
+                ["-p", "quickloop"]
+            );
+            // name="x" without spaces now parses strictly.
+            assert_eq!(
+                cargo_scope_args(&["crates/extra/src/lib.rs".to_string()]),
+                ["-p", "extra_no_space"]
+            );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_scope_root_package_files_fall_back_to_workspace() {
+        // Root-package workspace shape: members list only names `crates/sub`,
+        // while the root package owns `src/` — a root regression must not
+        // escape a `crates/sub`-only scope.
+        let root =
+            std::env::temp_dir().join(format!("quickloop-scope-rootpkg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/sub/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"root-pkg\"\n\n[workspace]\nmembers = [\"crates/sub\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/sub/Cargo.toml"),
+            "[package]\nname = \"sub\"\n",
+        )
+        .unwrap();
+        with_cwd(&root, || {
+            assert_eq!(
+                cargo_scope_args(&["src/lib.rs".to_string()]),
+                ["--workspace"]
+            );
+            assert_eq!(
+                cargo_scope_args(&[
+                    "src/lib.rs".to_string(),
+                    "crates/sub/src/lib.rs".to_string()
+                ]),
                 ["--workspace"]
             );
         });
