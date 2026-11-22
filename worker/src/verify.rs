@@ -194,7 +194,9 @@ fn cargo_scope_args(changed: &[String]) -> Vec<String> {
     let Ok(root_manifest) = fs::read_to_string("Cargo.toml") else {
         return vec!["--workspace".to_string()];
     };
-    let members = workspace_members(&root_manifest);
+    let Some(members) = workspace_members(&root_manifest) else {
+        return vec!["--workspace".to_string()];
+    };
     if members.is_empty() {
         return vec!["--workspace".to_string()];
     }
@@ -244,49 +246,99 @@ fn cargo_scope_args(changed: &[String]) -> Vec<String> {
     args
 }
 
-/// `members = [...]` array entries from a workspace `Cargo.toml` — a tiny
+/// `members = [...]` entries from a workspace `Cargo.toml` — a tiny
 /// targeted scan rather than a toml dependency (see §5.3 dependency diet).
-fn workspace_members(manifest: &str) -> Vec<String> {
+///
+/// Strict on purpose: entries must be clean double- or single-quoted
+/// strings, and any leftover text after a closing quote (beyond `,`, `]`,
+/// and whitespace — trailing comments are stripped per line first) aborts
+/// the whole parse with `None`. A lossy parse here would let a real member
+/// escape a partial `-p` scope, so valid-but-unrepresentable TOML is
+/// treated as unparsable, never skipped.
+fn workspace_members(manifest: &str) -> Option<Vec<String>> {
     let mut members = Vec::new();
-    let mut in_array = false;
-    for line in manifest.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("members") {
-            if let Some(items) = rest
-                .trim_start()
-                .strip_prefix('=')
-                .and_then(|s| s.trim_start().strip_prefix('['))
-            {
-                in_array = true;
-                for item in items.split(',') {
-                    push_member(item, &mut members);
+    let mut section = String::new();
+    let mut opened = false;
+    let mut closed = false;
+    for raw in manifest.lines() {
+        let line = match raw.split_once('#') {
+            Some((code, _)) => code.trim(),
+            None => raw.trim(),
+        };
+        if line.is_empty() {
+            continue;
+        }
+        if !opened {
+            if line.starts_with('[') && line.ends_with(']') {
+                section = line[1..line.len() - 1].trim().to_string();
+            } else if section == "workspace" {
+                if let Some(inner) = line.strip_prefix("members").and_then(|rest| {
+                    rest.trim_start()
+                        .strip_prefix('=')
+                        .and_then(|s| s.trim_start().strip_prefix('['))
+                }) {
+                    opened = true;
+                    // A multi-line array legitimately stays open here; the
+                    // final `opened && !closed` check covers unterminated
+                    // arrays. Only garbage aborts immediately.
+                    let (closed_now, ok) = scan_items(inner, &mut members)?;
+                    if !ok {
+                        return None;
+                    }
+                    if closed_now {
+                        closed = true;
+                    }
                 }
-                if items.contains(']') {
-                    in_array = false;
-                }
-                continue;
             }
-        } else if in_array {
-            for item in line.split(',') {
-                push_member(item, &mut members);
-            }
-            if line.contains(']') {
-                in_array = false;
-            }
+            continue;
+        }
+        // Inside the array: this line must either close it or add clean
+        // items — a line containing a section header mid-array is garbage.
+        let (closed_now, ok) = scan_items(line, &mut members)?;
+        if !ok {
+            return None;
+        }
+        if closed_now {
+            closed = true;
+            break;
         }
     }
-    members
+    if opened && !closed {
+        return None;
+    }
+    Some(members)
 }
 
-fn push_member(item: &str, members: &mut Vec<String>) {
-    let item = item.trim().trim_end_matches(']').trim();
-    let Some(quoted) = item.strip_prefix('"') else {
-        return;
-    };
-    let value = quoted.trim_end_matches('"');
-    if !value.is_empty() {
-        members.push(value.to_string());
+/// Scan array items from the text following the opening `[` (comments
+/// already stripped). Returns `(closed, ok)` where `closed` means a `]`
+/// terminated the array in this text (only whitespace may follow) and `ok`
+/// means every item was a clean double- or single-quoted string.
+fn scan_items(text: &str, members: &mut Vec<String>) -> Option<(bool, bool)> {
+    let mut quote: Option<char> = None;
+    let mut current = String::new();
+    for ch in text.chars() {
+        match quote {
+            Some(q) if ch == q => {
+                if current.is_empty() {
+                    return None;
+                }
+                members.push(std::mem::take(&mut current));
+                quote = None;
+            }
+            Some(_q) => current.push(ch),
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                ',' | ' ' | '\t' => {}
+                ']' => return Some((true, true)),
+                _ => return None,
+            },
+        }
     }
+    if quote.is_some() {
+        // Unterminated string reaching end-of-line — not a clean entry.
+        return None;
+    }
+    Some((false, true))
 }
 
 /// The `[package] name` of a member crate: the first `name = "..."` before
@@ -299,8 +351,16 @@ fn push_member(item: &str, members: &mut Vec<String>) {
 fn package_name(member_dir: &Path) -> Option<String> {
     let manifest = fs::read_to_string(member_dir.join("Cargo.toml")).ok()?;
     let mut section = String::new();
-    for line in manifest.lines() {
-        let line = line.trim();
+    for raw in manifest.lines() {
+        // Strip trailing comments first so `[package] # note` headers and
+        // `name = "x" # why` values parse the same as their plain forms.
+        let line = match raw.split_once('#') {
+            Some((code, _)) => code.trim(),
+            None => raw.trim(),
+        };
+        if line.is_empty() {
+            continue;
+        }
         if line.starts_with('[') && line.ends_with(']') {
             section = line[1..line.len() - 1].trim().to_string();
             continue;
@@ -686,14 +746,28 @@ mod tests {
     #[test]
     fn cargo_scope_maps_changed_paths_to_member_packages() {
         let manifest = "# comment\n[workspace]\nresolver = \"2\"\nmembers = [\n  \"worker\",\n  \"demo-repo\",\n]\ndefault-members = [\"worker\"]\n";
-        assert_eq!(workspace_members(manifest), vec!["worker", "demo-repo"]);
+        assert_eq!(
+            workspace_members(manifest),
+            Some(vec!["worker".to_string(), "demo-repo".to_string()])
+        );
         // Multi-item single line, spacing variants.
         assert_eq!(
-            workspace_members("members = [\"a\", \"b\"]"),
-            vec!["a", "b"]
+            workspace_members("[workspace]\nmembers = [\"a\", \"b\"]"),
+            Some(vec!["a".to_string(), "b".to_string()])
         );
-        // No members list (standalone project) → empty.
-        assert!(workspace_members("[package]\nname = \"x\"\n").is_empty());
+        // No members list (standalone project) → Some(empty), not a parse
+        // failure — the caller's empty-scope rule handles it.
+        assert_eq!(
+            workspace_members("[package]\nname = \"x\"\n"),
+            Some(Vec::new())
+        );
+        // Single-quoted literal strings are valid TOML and must parse.
+        assert_eq!(
+            workspace_members("[workspace]\nmembers = [\"a\", 'b']"),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        // Unclosed array → None (caller falls back to --workspace).
+        assert_eq!(workspace_members("[workspace]\nmembers = [\"a\"\n"), None);
     }
 
     #[test]
@@ -754,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn cargo_scope_lossy_manifests_fall_back_to_workspace() {
+    fn cargo_scope_lossy_manifests_parse_or_fall_back() {
         let root =
             std::env::temp_dir().join(format!("quickloop-scope-lossy-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -762,15 +836,15 @@ mod tests {
         fs::create_dir_all(root.join("crates/extra/src")).unwrap();
         fs::write(
             root.join("Cargo.toml"),
-            // Trailing inline comment on the members line: the naive parser
-            // would produce a garbage last member — the completeness rule
-            // must still force the fallback for unmapped paths.
+            // Trailing inline comment on the members line — comments are
+            // stripped per line before scanning, so this parses cleanly.
             "[workspace]\nmembers = [\"worker\", \"crates/extra\", \"demo-repo\"] # note\n",
         )
         .unwrap();
         fs::write(
             root.join("worker/Cargo.toml"),
-            // Trailing comment after the quoted name — strict parse → None.
+            // Trailing comment after the quoted name — split('"') takes the
+            // text between the quotes, so this parses cleanly too.
             "[package]\nname = \"quickloop\" # the cli\n",
         )
         .unwrap();
@@ -779,26 +853,98 @@ mod tests {
             "[package]\nname=\"extra_no_space\"\n",
         )
         .unwrap();
+        fs::create_dir_all(root.join("demo-repo/src")).unwrap();
+        fs::write(
+            root.join("demo-repo/Cargo.toml"),
+            "[package]\nname = \"demo_repo\"\n",
+        )
+        .unwrap();
         with_cwd(&root, || {
-            // worker maps cleanly, but demo-repo (with a comment-corrupted
-            // manifest entry) is unmapped → fallback, never a partial scope.
             assert_eq!(
                 cargo_scope_args(&[
                     "worker/src/main.rs".to_string(),
                     "demo-repo/src/auth.rs".to_string()
                 ]),
-                ["--workspace"]
+                ["-p", "quickloop", "-p", "demo_repo"]
             );
-            // worker alone: the trailing comment after the quoted name parses
-            // cleanly (split('"') takes the text between the quotes).
             assert_eq!(
                 cargo_scope_args(&["worker/src/main.rs".to_string()]),
                 ["-p", "quickloop"]
             );
-            // name="x" without spaces now parses strictly.
             assert_eq!(
                 cargo_scope_args(&["crates/extra/src/lib.rs".to_string()]),
                 ["-p", "extra_no_space"]
+            );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_scope_single_quoted_and_commented_members_parse_fully() {
+        // Round-3 review escape shape: `push_member` silently dropped
+        // single-quoted entries and corrupted the last entry when a trailing
+        // comment followed the closing bracket — in both cases the nested
+        // member `a/b` vanished from the parsed list and its regression
+        // escaped a scope pinned to `a`. The strict parser accepts both
+        // forms exactly, so `bee` is now inside the scope instead of
+        // escaping it.
+        let root =
+            std::env::temp_dir().join(format!("quickloop-scope-nested-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a/src")).unwrap();
+        fs::create_dir_all(root.join("a/b/src")).unwrap();
+        fs::write(root.join("a/Cargo.toml"), "[package]\nname = \"apa\"\n").unwrap();
+        fs::write(root.join("a/b/Cargo.toml"), "[package]\nname = \"bee\"\n").unwrap();
+        for (tag, manifest) in [
+            (
+                "double-quoted + trailing comment",
+                "[workspace]\nmembers = [\"a\", \"a/b\"] # note\n",
+            ),
+            (
+                "single-quoted literal string",
+                "[workspace]\nmembers = [\"a\", 'a/b']\n",
+            ),
+        ] {
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(root.join("a/b/src")).unwrap();
+            fs::write(root.join("Cargo.toml"), manifest).unwrap();
+            fs::write(root.join("a/Cargo.toml"), "[package]\nname = \"apa\"\n").unwrap();
+            fs::write(root.join("a/b/Cargo.toml"), "[package]\nname = \"bee\"\n").unwrap();
+            with_cwd(&root, || {
+                // Member `a` also prefix-matches (superset is safe); what the
+                // fix guarantees is that `bee` is INSIDE the scope, not
+                // silently escaped from it.
+                assert_eq!(
+                    cargo_scope_args(&["a/b/src/lib.rs".to_string()]),
+                    ["-p", "apa", "-p", "bee"],
+                    "{tag}: the nested member must be in scope, not escaped"
+                );
+            });
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_scope_garbage_entries_abort_the_scope() {
+        // The one direction the strict parser must keep fail-closed: an
+        // entry it cannot represent exactly (bare word, unclosed quote)
+        // aborts the whole parse → whole workspace, never a partial scope.
+        let root =
+            std::env::temp_dir().join(format!("quickloop-scope-garbage-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a/src")).unwrap();
+        fs::create_dir_all(root.join("a/b/src")).unwrap();
+        fs::write(root.join("a/Cargo.toml"), "[package]\nname = \"apa\"\n").unwrap();
+        fs::write(root.join("a/b/Cargo.toml"), "[package]\nname = \"bee\"\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", bare-word]\n",
+        )
+        .unwrap();
+        with_cwd(&root, || {
+            assert_eq!(
+                cargo_scope_args(&["a/b/src/lib.rs".to_string()]),
+                ["--workspace"]
             );
         });
         let _ = fs::remove_dir_all(root);
