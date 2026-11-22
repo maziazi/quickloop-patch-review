@@ -6,7 +6,7 @@
 //! cross-checked against the PR reference before any public write, and the
 //! push targets the PR's head branch explicitly. Then: commit the verified
 //! working tree (worker telemetry never staged — `.quickloop/` is kept out
-//! via `.git/info/exclude` and explicit pathspecs) with a
+//! via committed ignore rules and `.git/info/exclude`) with a
 //! `QuickLoop-Iteration` trailer, push, upsert the single PR status
 //! comment (marker-based, never spammed), and persist an honest telemetry
 //! record — also on failures. `--dry-run` performs the gate re-check and
@@ -143,7 +143,13 @@ fn apply_publish(
             .trim()
             .is_empty();
         if dirty {
-            git::run(&["add", "-A", "--", ":(exclude).quickloop"])?;
+            // Plain `git add -A`: ignore rules keep `.quickloop/` out
+            // (committed `.gitignore` + `ensure_local_exclude` above) and
+            // git skips ignored paths silently. Naming `.quickloop` via an
+            // `:(exclude)` pathspec here would make git treat the ignored
+            // directory as explicitly requested and abort with "paths are
+            // ignored" — caught by the end-to-end loop proof.
+            git::run(&["add", "-A"])?;
             let message = format!(
                 "fix: apply QuickLoop patch (verified score 100)\n\nQuickLoop-Iteration: {iteration}"
             );
@@ -477,6 +483,102 @@ mod tests {
         root
     }
 
+    /// Passing-gate fixture extended for the REAL publish path: a local
+    /// bare remote as `origin` (so `git push` works offline) and a smarter
+    /// `gh` shim answering each call shape the publish flow makes.
+    #[cfg(unix)]
+    fn real_publish_fixture(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let root = passing_gate_fixture(tag);
+        let origin = std::env::temp_dir().join(format!("quickloop-publish-{tag}-origin.git"));
+        let _ = fs::remove_dir_all(&origin);
+        let origin_arg = origin.to_string_lossy().to_string();
+        git_in(&root, &["init", "--bare", "-q", &origin_arg]);
+        git_in(&root, &["remote", "add", "origin", &origin_arg]);
+        git_in(&root, &["push", "-q", "origin", "main"]);
+        let shim = root.join("bin/gh");
+        fs::write(
+            &shim,
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"$GH_CALLS\"\n\
+             case \"$*\" in\n\
+             *headRefName*) echo main ;;\n\
+             *nameWithOwner*) echo test/fixture ;;\n\
+             *--input*) echo '{\"html_url\":\"https://example.invalid/comments/9\"}' ;;\n\
+             *) echo '[]' ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&shim).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&shim, perms).unwrap();
+        root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_publish_commits_pushes_and_upserts_comment_offline() {
+        let root = real_publish_fixture("real-ok");
+        // The "model patch": a dirty-but-valid source tweak that keeps the
+        // gate green — and `.quickloop/` telemetry present to prove it is
+        // never staged.
+        fs::create_dir_all(root.join(".quickloop")).unwrap();
+        fs::write(root.join(".quickloop/artifact.txt"), "telemetry\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn one() -> u32 { 1 } // touched\n\n#[test]\nfn one_is_one() {\n    assert_eq!(one(), 1);\n}\n").unwrap();
+        let gh_calls = root.join("gh-calls.log");
+        let shim_dir = root.join("bin");
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        with_cwd(&root, || {
+            // Prepend the shim dir: PATH is searched in order, and the
+            // developer's real `gh` lives earlier in the original PATH.
+            std::env::set_var("PATH", format!("{}:{}", shim_dir.display(), original_path));
+            std::env::set_var("GH_CALLS", &gh_calls);
+            let commits_before = git_in(&root, &["rev-list", "--count", "HEAD"])
+                .trim()
+                .to_string();
+
+            run("42", false, 1).expect("real publish on a passing gate must succeed");
+
+            assert_eq!(
+                git_in(&root, &["rev-list", "--count", "HEAD"]).trim(),
+                (commits_before.parse::<u32>().unwrap() + 1).to_string(),
+                "real publish must commit exactly once"
+            );
+            let message = git_in(&root, &["log", "-1", "--format=%B"]).to_lowercase();
+            assert!(message.contains("score 100"), "message: {message}");
+            assert!(
+                message.contains("quickloop-iteration: 1"),
+                "trailer missing: {message}"
+            );
+            let files = git_in(&root, &["show", "--name-only", "--format=", "HEAD"]);
+            assert!(!files.contains(".quickloop"), "telemetry leaked: {files}");
+            assert!(files.contains("src/lib.rs"));
+            let pushed = git_in(&root, &["ls-remote", "origin", "refs/heads/main"]);
+            let local = git_in(&root, &["rev-parse", "HEAD"]);
+            assert_eq!(
+                pushed.trim().split('\t').next().unwrap_or_default(),
+                local.trim(),
+                "origin/main must match the published commit"
+            );
+            let calls = fs::read_to_string(&gh_calls).unwrap();
+            assert!(calls.contains("headRefName"), "calls: {calls}");
+            assert!(calls.contains("comments"), "calls: {calls}");
+            let record = fs::read_to_string(root.join(".quickloop/run-42.json")).unwrap();
+            assert!(record.contains("\"dry_run\":false"), "record: {record}");
+            assert!(record.contains("\"committed\":true"), "record: {record}");
+            assert!(record.contains("example.invalid"), "record: {record}");
+            assert!(
+                !record.contains("\"error\""),
+                "successful publish must not carry an error field: {record}"
+            );
+            std::env::remove_var("GH_CALLS");
+            std::env::set_var("PATH", original_path);
+        });
+        let _ = fs::remove_dir_all(root);
+        let _ =
+            fs::remove_dir_all(std::env::temp_dir().join("quickloop-publish-real-ok-origin.git"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn dry_run_happy_path_makes_zero_gh_calls_and_no_commit() {
@@ -487,7 +589,9 @@ mod tests {
         let shim_dir = root.join("bin");
         let original_path = std::env::var("PATH").unwrap_or_default();
         with_cwd(&root, || {
-            std::env::set_var("PATH", format!("{}:{}", original_path, shim_dir.display()));
+            // Prepend the shim dir: PATH is searched in order, and the
+            // developer's real `gh` lives earlier in the original PATH.
+            std::env::set_var("PATH", format!("{}:{}", shim_dir.display(), original_path));
             std::env::set_var("GH_CALLS", &gh_calls);
             let commits_before = git_in(&root, &["rev-list", "--count", "HEAD"])
                 .trim()
