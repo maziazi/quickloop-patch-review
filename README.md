@@ -31,7 +31,8 @@
   <a href="#workflow">Workflow</a> •
   <a href="#layered-ai-architecture">Architecture</a> •
   <a href="#quick-start">Quick Start</a> •
-  <a href="#documentation">Documentation</a>
+  <a href="#documentation">Documentation</a> •
+  <a href="#roadmap">Roadmap</a>
 </p>
 
 </div>
@@ -66,6 +67,14 @@ OPTION B (If hosted externally): Replace Option A with a linked preview image:
 <sub><b>60-second real-time run</b> on <code>demo-repo/</code> — this repository's live demo PR #5: triaging <code>CRITICAL</code> defects, preserving the <code>MINOR</code> naming finding, verifying <code>score == 100</code>, demonstrating anti-cheat <code>BLOCKED</code> enforcement on test deletion, and publishing API-sourced telemetry.</sub>
 
 </div>
+
+### The Three Proof Moments (what to watch for)
+
+**1. A real closed loop — not a comment bot.** The agent does not stop at review comments: it emits `SEARCH/REPLACE` patches, applies them atomically, re-runs the deterministic Rust gate, and iterates until `quickloop verify` prints `score == 100` → `READY_TO_MERGE`. Two planted `CRITICAL` defects (divide-by-zero panic + hardcoded backdoor credential) get fixed by the loop itself. Meanwhile the planted `MINOR` naming nit (`let d = age_days / 30`) is **reported and left untouched** — no endless style-debate loop, the severity filter stays intact.
+
+**2. The anti-cheat moment (`S_scope` → `BLOCKED`).** Hand the loop a patch that edits or deletes the protected `demo-repo/tests/regression_test.rs` and watch the guardrail fire live: `score: 0, blocked: true`, the working tree is **reverted immediately** (the test file comes back byte-identical), and the run halts with `BLOCKED` — exit code stays `0` because a blocked state is structured data, not a crash. One frame of this is worth a thousand words for engineers who have watched agents "fix" flaky tests by deleting them.
+
+**3. Speed and honest telemetry on Cerebras + Kimi K3.1 Pro.** The prompt prefix is byte-stable, so `cached_tokens > 0` from iteration ≥ 2 keeps usage inside the `100K` uncached TPM ceiling; patches stay ~400-token `SEARCH/REPLACE` hunks (never whole-file rewrites); `reasoning_effort` is `low` for review and **OFF** for patch synthesis. Every number shown comes from Cerebras API `usage` / `time_info` fields and local monotonic clocks — `queue_time_s`, `ttft_s`, `output_tps`, `e2e_tps`, `cache_hit_rate` — never from a tokenizer estimate.
 
 ---
 
@@ -163,7 +172,7 @@ The language model **never** decides whether a PR is ready to merge. Readiness i
 $$\text{score} = 40 \cdot S_{\text{test}} + 30 \cdot S_{\text{lint}} + 20 \cdot S_{\text{sec}} + 10 \cdot S_{\text{scope}}$$
 
 - **`READY_TO_MERGE`** — `score == 100` (all four binary checks pass). Commits, pushes, and upserts **one** structured PR status comment.
-- **`NEEDS_HUMAN`** — Any `ARCHITECTURAL` finding on Phase 0 review, or `max_iterations` (default `5`) reached.
+- **`NEEDS_HUMAN`** — Any `ARCHITECTURAL` finding on Phase 2 review, or `max_iterations` (default `5`) reached.
 - **`BLOCKED`** — Protected test files modified or deleted (`S_scope == 0`). `quickloop` immediately reverts the iteration's patch and halts execution.
 
 ---
@@ -326,6 +335,37 @@ quickloop-patch-review/
 | [**`docs/PLAN.md`**](./docs/PLAN.md) | Hackathon execution plan, scope priorities, and demo structure |
 | [**`bench/tps-bounty.md`**](./bench/tps-bounty.md) | Reproducible TPS measurements, warm vs. cold runs, and raw telemetry proof |
 | [**`CONTRIBUTING.md`**](./CONTRIBUTING.md) | Isolated dev setup, Rust/skill conventions, and required PR verification checks |
+
+---
+
+## Roadmap
+
+An honest assessment of what QuickLoop does well today, and where it goes next. Contributions against any item below are welcome.
+
+| Area | Current state (honest) | Next step |
+| :--- | :--- | :--- |
+| **CI** | No GitHub Actions workflow yet — the four verification gates exist only as documented local commands | Add `.github/workflows/ci.yml` running `fmt --check` / `clippy -D warnings` / `test --workspace` / `build --release` on every PR |
+| **API-side telemetry** | `RunRecord` persists worker-measured fields (`score`, walls, commit, comment); Cerebras `queue_time_s` / `ttft_s` / `output_tps` / `e2e_tps` / `cache_hit_rate` are not wired into it yet | Capture the API `usage` / `time_info` fields in the OpenClaw harness path and persist them into `.quickloop/run-<pr>.json` (unlocks the BL-01–BL-05 tables and the TPS bounty) |
+| **Repo-root assumption** | `ensure_local_exclude` and the comment-body path assume `quickloop` is invoked from the repository root (true per the skills contract; breaks from a subdirectory) | Resolve the top-level via `git rev-parse --show-toplevel` and anchor every path there |
+| **Language coverage** | `verify` hardcodes `cargo test` / `cargo clippy` — QuickLoop loops Rust repositories only | Per-repo check configuration (`.quickloop.toml`: test/lint/sec commands) so any language with a deterministic gate can be looped |
+| **Security-scan depth** | `S_sec` is a 10-pattern hardcoded scan (backdoor keys, private keys, AWS keys, credential literals) — a tripwire, not a SAST | Plug in real tooling (`cargo-audit`, `semgrep`) as an additional check while keeping the deterministic-gate contract |
+| **Staging scope** | `git add -u` stages modifications/deletions of all tracked files — correct for the loop's own patches, but an agent side command that edits an unrelated tracked file would ride along | Stage exactly the paths changed since baseline (`baseline.json` `changed_paths`) for defense in depth |
+| **Comment pagination** | The status-comment upsert scans only the first 100 PR comments (documented limitation) | Paginate via `Link` headers or search by marker directly |
+| **Platform coverage** | Real-publish path is integration-tested on unix only (`sh` shim); no Windows CI | Windows runner job + a portable shim strategy |
+| **Fan-out** | The loop runs one PR per session; BL-05 sketches disjoint parallel runs | A coordinator mode fanning out over multiple open PRs with per-PR state isolation |
+| **Trigger surface** | Invoked manually (slash skill or `openclaw agent -m`) | GitHub App / Actions mode: run QuickLoop automatically on every newly opened PR |
+
+---
+
+## Announcement Playbook
+
+Positioning is deliberately split per platform: **X gets the visual proof in under a minute; Reddit gets the architecture and the receipts.**
+
+| Aspect | X (Twitter) | Reddit (r/cerebras) |
+| :--- | :--- | :--- |
+| **Core focus** | Speed + visual impact in ≤ 60s; sharp hook in the first 3–5 seconds (the `S_scope → BLOCKED` revert frame is the hook) | Architecture depth, honest metrics, and reproducibility — no empty hype |
+| **Must include** | Video ≤ 60s, `@Cerebras`, `@Kimi_Moonshot`, `#KimiOnCerebras`, GitHub link: <https://github.com/maziazi/quickloop-patch-review> | Video ≤ 60s (native upload or YouTube link), concise technical description, GitHub link, flair **"Kimi K3.1 Pro Hackathon"** |
+| **Supporting points** | `score == 100` gate on screen; `BLOCKED` moment; `cached_tokens > 0` on iteration 2 | Gate formula `40·test + 30·lint + 20·sec + 10·scope`; raw `.quickloop/run-*.json` telemetry; reproducible demo repo (`demo/planted-bugs` PR) |
 
 ---
 
