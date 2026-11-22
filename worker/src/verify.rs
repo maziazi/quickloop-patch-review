@@ -179,16 +179,226 @@ fn score_of(checks: &Checks) -> u32 {
         + 10 * u32::from(checks.scope)
 }
 
+/// Cargo argument scope for the gate: `-p <pkg>` per workspace member,
+/// used **only when every changed path maps into some member directory**
+/// (completeness-driven). Member directories come from the root
+/// `Cargo.toml`; package names from each member's own `[package] name`.
+///
+/// This direction matters: any lossiness in the mapping — root-package
+/// worktrees (root files have no member dir), glob members, truncated
+/// trailing comments, unparsable names, root-level files like `README.md`
+/// or `Cargo.lock` — leaves a changed path unmapped and forces the
+/// `--workspace` fallback. Scoping is an optimization, never a
+/// completeness risk.
+fn cargo_scope_args(changed: &[String]) -> Vec<String> {
+    let Ok(root_manifest) = fs::read_to_string("Cargo.toml") else {
+        return vec!["--workspace".to_string()];
+    };
+    let Some(members) = workspace_members(&root_manifest) else {
+        return vec!["--workspace".to_string()];
+    };
+    if members.is_empty() {
+        return vec!["--workspace".to_string()];
+    }
+    // Glob members (`crates/*`) expand beyond their literal directory text:
+    // a file under a glob-expanded sibling package would prefix-match the
+    // glob's root member (e.g. `a/b/src` matches member `a`), silently
+    // scoping the gate away from the real crate. Unparsable → fallback.
+    if members
+        .iter()
+        .any(|m| m.contains('*') || m.contains('?') || m.contains('['))
+    {
+        return vec!["--workspace".to_string()];
+    }
+    let mut packages = Vec::new();
+    // Deterministic order: walk members as listed in the manifest.
+    for member in &members {
+        if !changed
+            .iter()
+            .any(|path| path.starts_with(format!("{member}/").as_str()))
+        {
+            continue;
+        }
+        let Some(name) = package_name(Path::new(member)) else {
+            return vec!["--workspace".to_string()];
+        };
+        if !packages.contains(&name) {
+            packages.push(name);
+        }
+    }
+    // Completeness rule: every changed path must have mapped into some
+    // member — any unmapped path (root package files, glob members,
+    // root-level files like README.md) forces the whole workspace so a
+    // regression can never escape a partial scope.
+    let all_mapped = changed.iter().all(|path| {
+        members
+            .iter()
+            .any(|m| path.starts_with(format!("{m}/").as_str()))
+    });
+    if !all_mapped || packages.is_empty() {
+        return vec!["--workspace".to_string()];
+    }
+    let mut args = Vec::with_capacity(packages.len() * 2);
+    for name in packages {
+        args.push("-p".to_string());
+        args.push(name);
+    }
+    args
+}
+
+/// `members = [...]` entries from a workspace `Cargo.toml` — a tiny
+/// targeted scan rather than a toml dependency (see §5.3 dependency diet).
+///
+/// Strict on purpose: entries must be clean double- or single-quoted
+/// strings, and any leftover text after a closing quote (beyond `,`, `]`,
+/// and whitespace — trailing comments are stripped per line first) aborts
+/// the whole parse with `None`. A lossy parse here would let a real member
+/// escape a partial `-p` scope, so valid-but-unrepresentable TOML is
+/// treated as unparsable, never skipped.
+fn workspace_members(manifest: &str) -> Option<Vec<String>> {
+    let mut members = Vec::new();
+    let mut section = String::new();
+    let mut opened = false;
+    let mut closed = false;
+    for raw in manifest.lines() {
+        let line = match raw.split_once('#') {
+            Some((code, _)) => code.trim(),
+            None => raw.trim(),
+        };
+        if line.is_empty() {
+            continue;
+        }
+        if !opened {
+            if line.starts_with('[') && line.ends_with(']') {
+                section = line[1..line.len() - 1].trim().to_string();
+            } else if section == "workspace" {
+                if let Some(inner) = line.strip_prefix("members").and_then(|rest| {
+                    rest.trim_start()
+                        .strip_prefix('=')
+                        .and_then(|s| s.trim_start().strip_prefix('['))
+                }) {
+                    opened = true;
+                    // A multi-line array legitimately stays open here; the
+                    // final `opened && !closed` check covers unterminated
+                    // arrays. Only garbage aborts immediately.
+                    let (closed_now, ok) = scan_items(inner, &mut members)?;
+                    if !ok {
+                        return None;
+                    }
+                    if closed_now {
+                        closed = true;
+                    }
+                }
+            }
+            continue;
+        }
+        // Inside the array: this line must either close it or add clean
+        // items — a line containing a section header mid-array is garbage.
+        let (closed_now, ok) = scan_items(line, &mut members)?;
+        if !ok {
+            return None;
+        }
+        if closed_now {
+            closed = true;
+            break;
+        }
+    }
+    if opened && !closed {
+        return None;
+    }
+    Some(members)
+}
+
+/// Scan array items from the text following the opening `[` (comments
+/// already stripped). Returns `(closed, ok)` where `closed` means a `]`
+/// terminated the array in this text (only whitespace may follow) and `ok`
+/// means every item was a clean double- or single-quoted string.
+fn scan_items(text: &str, members: &mut Vec<String>) -> Option<(bool, bool)> {
+    let mut quote: Option<char> = None;
+    let mut current = String::new();
+    for ch in text.chars() {
+        match quote {
+            Some(q) if ch == q => {
+                if current.is_empty() {
+                    return None;
+                }
+                members.push(std::mem::take(&mut current));
+                quote = None;
+            }
+            Some(_q) => current.push(ch),
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                ',' | ' ' | '\t' => {}
+                ']' => return Some((true, true)),
+                _ => return None,
+            },
+        }
+    }
+    if quote.is_some() {
+        // Unterminated string reaching end-of-line — not a clean entry.
+        return None;
+    }
+    Some((false, true))
+}
+
+/// The `[package] name` of a member crate: the first `name = "..."` before
+/// any dependency section starts (package metadata always precedes deps).
+/// Strict: the value must be a clean quoted string (`split('"')` takes the
+/// text between the first two quotes, so a trailing `# comment` parses
+/// cleanly; exotic lines yield `None` → the caller falls back to
+/// `--workspace` instead of passing a garbage `-p` that would fail the
+/// gate forever).
+fn package_name(member_dir: &Path) -> Option<String> {
+    let manifest = fs::read_to_string(member_dir.join("Cargo.toml")).ok()?;
+    let mut section = String::new();
+    for raw in manifest.lines() {
+        // Strip trailing comments first so `[package] # note` headers and
+        // `name = "x" # why` values parse the same as their plain forms.
+        let line = match raw.split_once('#') {
+            Some((code, _)) => code.trim(),
+            None => raw.trim(),
+        };
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_string();
+            continue;
+        }
+        if section != "package" {
+            // Only `[package] name` is the crate's identity — a `[lib] name`
+            // or dependency key is a different thing entirely.
+            continue;
+        }
+        let Some(rest) = line
+            .strip_prefix("name = ")
+            .or_else(|| line.strip_prefix("name="))
+        else {
+            continue;
+        };
+        let value = rest.split('"').nth(1).filter(|v| !v.is_empty())?;
+        return Some(value.to_string());
+    }
+    None
+}
+
 /// Run test/lint/security checks concurrently (cargo serializes itself on
 /// the target-dir lock, the security scan is pure I/O).
+///
+/// Cargo scope: only workspace members whose directories intersect the
+/// changed paths are re-checked. Sound because an unchanged member cannot
+/// produce new lint or test failures; when nothing maps to a member (e.g.
+/// a root-level file or a standalone cargo project without a members
+/// list), fall back to the whole workspace.
 fn run_checks_concurrent(
     changed: &[String],
 ) -> Result<(CheckResult, CheckResult, CheckResult), String> {
     let changed_owned = changed.to_vec();
+    let cargo_scope = cargo_scope_args(&changed_owned);
     thread::scope(
         |s| -> Result<(CheckResult, CheckResult, CheckResult), String> {
-            let test_handle = s.spawn(run_test_check);
-            let lint_handle = s.spawn(run_lint_check);
+            let test_handle = s.spawn(|| run_test_check(&cargo_scope));
+            let lint_handle = s.spawn(|| run_lint_check(&cargo_scope));
             let sec_handle = s.spawn(|| run_sec_check(&changed_owned));
             let join = |handle: thread::ScopedJoinHandle<'_, Result<CheckResult, String>>| {
                 handle.join().unwrap_or_else(|_| {
@@ -203,8 +413,10 @@ fn run_checks_concurrent(
     )
 }
 
-fn run_test_check() -> Result<CheckResult, String> {
-    let output = run_tool("cargo", &["test", "--workspace"], TOOL_TIMEOUT_SECS)?;
+fn run_test_check(scope: &[String]) -> Result<CheckResult, String> {
+    let mut args = vec!["test"];
+    args.extend(scope.iter().map(String::as_str));
+    let output = run_tool("cargo", &args, TOOL_TIMEOUT_SECS)?;
     if output.timed_out {
         return Ok(failed(vec![format!(
             "cargo test timed out after {TOOL_TIMEOUT_SECS}s"
@@ -216,12 +428,13 @@ fn run_test_check() -> Result<CheckResult, String> {
     Ok(failed(concise_failures(&output.stdout, &output.stderr)))
 }
 
-fn run_lint_check() -> Result<CheckResult, String> {
-    let output = run_tool(
-        "cargo",
-        &["clippy", "--workspace", "--", "-D", "warnings"],
-        TOOL_TIMEOUT_SECS,
-    )?;
+fn run_lint_check(scope: &[String]) -> Result<CheckResult, String> {
+    let mut args = vec!["clippy"];
+    args.extend(scope.iter().map(String::as_str));
+    args.push("--");
+    args.push("-D");
+    args.push("warnings");
+    let output = run_tool("cargo", &args, TOOL_TIMEOUT_SECS)?;
     if output.timed_out {
         return Ok(failed(vec![format!(
             "cargo clippy timed out after {TOOL_TIMEOUT_SECS}s"
@@ -462,8 +675,8 @@ fn concise_failures(stdout: &str, stderr: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        changed_since_baseline, evaluate, read_baseline, score_of, status_changed_fields,
-        SEC_PATTERNS,
+        cargo_scope_args, changed_since_baseline, evaluate, read_baseline, score_of,
+        status_changed_fields, workspace_members, SEC_PATTERNS,
     };
     use crate::testutil::with_cwd;
     use crate::verify::Checks;
@@ -528,6 +741,280 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8(out.stdout).expect("utf8")
+    }
+
+    #[test]
+    fn cargo_scope_maps_changed_paths_to_member_packages() {
+        let manifest = "# comment\n[workspace]\nresolver = \"2\"\nmembers = [\n  \"worker\",\n  \"demo-repo\",\n]\ndefault-members = [\"worker\"]\n";
+        assert_eq!(
+            workspace_members(manifest),
+            Some(vec!["worker".to_string(), "demo-repo".to_string()])
+        );
+        // Multi-item single line, spacing variants.
+        assert_eq!(
+            workspace_members("[workspace]\nmembers = [\"a\", \"b\"]"),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        // No members list (standalone project) → Some(empty), not a parse
+        // failure — the caller's empty-scope rule handles it.
+        assert_eq!(
+            workspace_members("[package]\nname = \"x\"\n"),
+            Some(Vec::new())
+        );
+        // Single-quoted literal strings are valid TOML and must parse.
+        assert_eq!(
+            workspace_members("[workspace]\nmembers = [\"a\", 'b']"),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        // Unclosed array → None (caller falls back to --workspace).
+        assert_eq!(workspace_members("[workspace]\nmembers = [\"a\"\n"), None);
+    }
+
+    #[test]
+    fn cargo_scope_args_fall_back_to_workspace_safely() {
+        let root =
+            std::env::temp_dir().join(format!("quickloop-scope-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        with_cwd(&root, || {
+            // No readable root manifest → whole workspace, never an empty scope.
+            assert_eq!(cargo_scope_args(&["src/x.rs".to_string()]), ["--workspace"]);
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_scope_scopes_to_intersecting_members_only() {
+        let root = std::env::temp_dir().join(format!("quickloop-scope-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("worker/src")).unwrap();
+        fs::create_dir_all(root.join("demo-repo/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"worker\", \"demo-repo\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("worker/Cargo.toml"),
+            "[package]\nname = \"quickloop\"\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("demo-repo/Cargo.toml"),
+            "[package]\nname = \"demo_repo\"\n",
+        )
+        .unwrap();
+        with_cwd(&root, || {
+            assert_eq!(
+                cargo_scope_args(&["demo-repo/src/auth.rs".to_string()]),
+                ["-p", "demo_repo"]
+            );
+            assert_eq!(
+                cargo_scope_args(&[
+                    "demo-repo/src/auth.rs".to_string(),
+                    "worker/src/main.rs".to_string()
+                ]),
+                ["-p", "quickloop", "-p", "demo_repo"]
+            );
+            // Completeness rule: ANY changed path that maps to no member
+            // (root-level files, unmapped crates) forces the whole workspace —
+            // a regression in an unmapped file must never escape the gate.
+            assert_eq!(
+                cargo_scope_args(&["demo-repo/src/auth.rs".to_string(), "README.md".to_string()]),
+                ["--workspace"]
+            );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_scope_lossy_manifests_parse_or_fall_back() {
+        let root =
+            std::env::temp_dir().join(format!("quickloop-scope-lossy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("worker/src")).unwrap();
+        fs::create_dir_all(root.join("crates/extra/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            // Trailing inline comment on the members line — comments are
+            // stripped per line before scanning, so this parses cleanly.
+            "[workspace]\nmembers = [\"worker\", \"crates/extra\", \"demo-repo\"] # note\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("worker/Cargo.toml"),
+            // Trailing comment after the quoted name — split('"') takes the
+            // text between the quotes, so this parses cleanly too.
+            "[package]\nname = \"quickloop\" # the cli\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/extra/Cargo.toml"),
+            "[package]\nname=\"extra_no_space\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("demo-repo/src")).unwrap();
+        fs::write(
+            root.join("demo-repo/Cargo.toml"),
+            "[package]\nname = \"demo_repo\"\n",
+        )
+        .unwrap();
+        with_cwd(&root, || {
+            assert_eq!(
+                cargo_scope_args(&[
+                    "worker/src/main.rs".to_string(),
+                    "demo-repo/src/auth.rs".to_string()
+                ]),
+                ["-p", "quickloop", "-p", "demo_repo"]
+            );
+            assert_eq!(
+                cargo_scope_args(&["worker/src/main.rs".to_string()]),
+                ["-p", "quickloop"]
+            );
+            assert_eq!(
+                cargo_scope_args(&["crates/extra/src/lib.rs".to_string()]),
+                ["-p", "extra_no_space"]
+            );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_scope_single_quoted_and_commented_members_parse_fully() {
+        // Round-3 review escape shape: `push_member` silently dropped
+        // single-quoted entries and corrupted the last entry when a trailing
+        // comment followed the closing bracket — in both cases the nested
+        // member `a/b` vanished from the parsed list and its regression
+        // escaped a scope pinned to `a`. The strict parser accepts both
+        // forms exactly, so `bee` is now inside the scope instead of
+        // escaping it.
+        let root =
+            std::env::temp_dir().join(format!("quickloop-scope-nested-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a/src")).unwrap();
+        fs::create_dir_all(root.join("a/b/src")).unwrap();
+        fs::write(root.join("a/Cargo.toml"), "[package]\nname = \"apa\"\n").unwrap();
+        fs::write(root.join("a/b/Cargo.toml"), "[package]\nname = \"bee\"\n").unwrap();
+        for (tag, manifest) in [
+            (
+                "double-quoted + trailing comment",
+                "[workspace]\nmembers = [\"a\", \"a/b\"] # note\n",
+            ),
+            (
+                "single-quoted literal string",
+                "[workspace]\nmembers = [\"a\", 'a/b']\n",
+            ),
+        ] {
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(root.join("a/b/src")).unwrap();
+            fs::write(root.join("Cargo.toml"), manifest).unwrap();
+            fs::write(root.join("a/Cargo.toml"), "[package]\nname = \"apa\"\n").unwrap();
+            fs::write(root.join("a/b/Cargo.toml"), "[package]\nname = \"bee\"\n").unwrap();
+            with_cwd(&root, || {
+                // Member `a` also prefix-matches (superset is safe); what the
+                // fix guarantees is that `bee` is INSIDE the scope, not
+                // silently escaped from it.
+                assert_eq!(
+                    cargo_scope_args(&["a/b/src/lib.rs".to_string()]),
+                    ["-p", "apa", "-p", "bee"],
+                    "{tag}: the nested member must be in scope, not escaped"
+                );
+            });
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_scope_garbage_entries_abort_the_scope() {
+        // The one direction the strict parser must keep fail-closed: an
+        // entry it cannot represent exactly (bare word, unclosed quote)
+        // aborts the whole parse → whole workspace, never a partial scope.
+        let root =
+            std::env::temp_dir().join(format!("quickloop-scope-garbage-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a/src")).unwrap();
+        fs::create_dir_all(root.join("a/b/src")).unwrap();
+        fs::write(root.join("a/Cargo.toml"), "[package]\nname = \"apa\"\n").unwrap();
+        fs::write(root.join("a/b/Cargo.toml"), "[package]\nname = \"bee\"\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", bare-word]\n",
+        )
+        .unwrap();
+        with_cwd(&root, || {
+            assert_eq!(
+                cargo_scope_args(&["a/b/src/lib.rs".to_string()]),
+                ["--workspace"]
+            );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_scope_root_package_files_fall_back_to_workspace() {
+        // Root-package workspace shape: members list only names `crates/sub`,
+        // while the root package owns `src/` — a root regression must not
+        // escape a `crates/sub`-only scope.
+        let root =
+            std::env::temp_dir().join(format!("quickloop-scope-rootpkg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/sub/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"root-pkg\"\n\n[workspace]\nmembers = [\"crates/sub\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/sub/Cargo.toml"),
+            "[package]\nname = \"sub\"\n",
+        )
+        .unwrap();
+        with_cwd(&root, || {
+            assert_eq!(
+                cargo_scope_args(&["src/lib.rs".to_string()]),
+                ["--workspace"]
+            );
+            assert_eq!(
+                cargo_scope_args(&[
+                    "src/lib.rs".to_string(),
+                    "crates/sub/src/lib.rs".to_string()
+                ]),
+                ["--workspace"]
+            );
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_scope_glob_member_rooted_at_literal_member_falls_back() {
+        // `members = ["a", "a/*"]`: a file under the glob-expanded sibling
+        // `a/b` prefix-matches the literal member `a`, so the completeness
+        // rule alone would wrongly scope the gate to `a`'s package while a
+        // regression in `a/b`'s package escapes. Glob metacharacters must
+        // force the `--workspace` fallback outright.
+        let root =
+            std::env::temp_dir().join(format!("quickloop-scope-glob-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("a/src")).unwrap();
+        fs::create_dir_all(root.join("a/b/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"a/*\"]\n",
+        )
+        .unwrap();
+        fs::write(root.join("a/Cargo.toml"), "[package]\nname = \"apa\"\n").unwrap();
+        fs::write(root.join("a/b/Cargo.toml"), "[package]\nname = \"bee\"\n").unwrap();
+        with_cwd(&root, || {
+            assert_eq!(
+                cargo_scope_args(&["a/b/src/lib.rs".to_string()]),
+                ["--workspace"]
+            );
+            assert_eq!(
+                cargo_scope_args(&["a/src/lib.rs".to_string()]),
+                ["--workspace"]
+            );
+        });
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
