@@ -1,34 +1,55 @@
 // QuickLoop — OpenClaw control-plane template.
-// Merge into ~/.openclaw/openclaw.json (JSON5). Never put a real API key in
-// this repository file; the key is read from the CEREBRAS_API_KEY env var.
+// Verified against OpenClaw 2026.10.9 (`openclaw config schema`).
+//
+// Apply with a validated single write (the key is referenced by env-var
+// name via SecretRef — never inline a real API key in this file):
+//
+//   set -a && source .env && set +a
+//   openclaw config patch --file config/openclaw.example.json5
+//
+// The gateway process must see CEREBRAS_API_KEY at request time: export it
+// in your shell profile, or append `export CEREBRAS_API_KEY=...` to
+// ~/.openclaw/service-env/ai.openclaw.gateway.env, then restart the gateway
+// (`openclaw gateway stop --force && openclaw gateway start`).
+//
+// Per hackathon rules, trial-key execution must run through the OpenClaw
+// harness.
 {
-  // Cerebras provider. Per hackathon rules, trial-key execution must run
-  // through the OpenClaw harness.
-  provider: {
-    baseUrl: "https://api.cerebras.ai/v1",
-    apiKeyEnv: "CEREBRAS_API_KEY",
-    // Verified trial model. Do NOT change to `-test` (returns HTTP 404).
-    model: "moonshotai-kimi-k3.1-pro-trial",
-    // Offline rehearsal fallback (config only): "gpt-oss-120b".
-    limits: {
-      contextTokens: 262144,
-      maxOutputTokens: 40960,
-      requestsPerMin: 1000,
-      totalTokensPerMin: 1000000,
-      uncachedTokensPerMin: 100000,
+  models: {
+    // "merge" keeps built-in providers and overlays this custom one.
+    mode: "merge",
+    providers: {
+      cerebras: {
+        baseUrl: "https://api.cerebras.ai/v1",
+        // Cerebras speaks the OpenAI chat-completions protocol.
+        api: "openai-completions",
+        // SecretRef: resolve the key from the environment at request time.
+        apiKey: { source: "env", provider: "default", id: "CEREBRAS_API_KEY" },
+        models: [
+          {
+            // Verified trial model. Do NOT change to `-test` (HTTP 404).
+            // Offline rehearsal fallback (config only): "gpt-oss-120b".
+            id: "moonshotai-kimi-k3.1-pro-trial",
+            name: "Kimi K3.1 Pro (Trial)",
+            // Verified trial limits.
+            contextWindow: 262144,
+            maxTokens: 40960,
+          },
+        ],
+      },
     },
   },
 
-  // Speed levers (docs/DESIGN.md §2): reasoning paid once in Phase 2 only.
-  inference: {
-    stream: true,
-    review: { maxTokens: 1500, reasoningEffort: "low" }, // Phase 2
-    patch: { maxTokens: 800, reasoningEffort: "off" },   // Phase 3
-  },
-
-  // Tool policy pinning + session pruning (cache-preservation rules).
-  tools: {
-    policy: ["exec", "read"],
-    pruneSupersededLogs: true,
+  // Default for agents without an explicit per-agent model override.
+  // If an agent pins its own `model` (e.g. agents.entries.main.model),
+  // pin QuickLoop runs instead:
+  //   openclaw agent --model cerebras/moonshotai-kimi-k3.1-pro-trial ...
+  // Thinking levels supported by the trial model: "off" | "ultra".
+  // QuickLoop loop runs use "off" (reasoning OFF on the patch path;
+  // minimal output tokens — docs/DESIGN.md §2).
+  agents: {
+    defaults: {
+      model: "cerebras/moonshotai-kimi-k3.1-pro-trial",
+    },
   },
 }
