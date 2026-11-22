@@ -1,0 +1,25 @@
+{
+  "run": "official-kimi-pr5-2026-11-22",
+  "model": "moonshotai-kimi-k3.1-pro-trial",
+  "harness": "OpenClaw 2026.10.9",
+  "pr": 5,
+  "verdict": "READY_TO_MERGE",
+  "score": 100,
+  "iteration": 1,
+  "usage": {
+    "input": 16995,
+    "output": 3901,
+    "cacheRead": 189440,
+    "reasoningTokens": 1629,
+    "cache_hit_rate": 0.918
+  },
+  "worker_gates": {
+    "verify_wall_s": 2.603,
+    "publish_wall_s": 9.53
+  },
+  "commit_files": [
+    "demo-repo/src/auth.rs",
+    "demo-repo/src/scoring.rs"
+  ],
+  "minor_nit_preserved": true
+}

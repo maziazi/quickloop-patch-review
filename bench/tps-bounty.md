@@ -4,7 +4,7 @@ Status: **MEASURED (2026-11-22)** — via OpenClaw 2026.10.9 (`openclaw infer mo
 
 ## What was measured (and how)
 
-- **End-to-end wall clock** per call, from local monotonic clocks around the full OpenClaw CLI invocation (includes process spawn + queue + TTFT + decode + teardown — these components are **not separable** because the `infer` CLI does not surface Cerebras `queue_time_s` / `ttft_s`; per §3.8 they are reported as absent, never estimated).
+- **End-to-end wall clock** per call, from local monotonic clocks around the full OpenClaw CLI invocation (includes process spawn + queue + TTFT + decode + teardown — these components are **not separable** because the `infer` CLI does not surface Cerebras `queue_time_s` / `ttft_s`; the project's telemetry rule is *honest or absent — never estimated*, so they are reported as absent).
 - **Token + cache figures** come from the official closed-loop run's harness usage report (`result.meta.agentMeta.usage`): `input` / `output` / `cacheRead` / `reasoningTokens`.
 - Raw evidence: `bench/raw-runs/official-kimi-pr5-{run,openclaw}.json` (official loop, gitignored locally), collection scripts in session logs; medians of N=3–4 unless noted.
 
@@ -37,6 +37,12 @@ Notes:
 - BL-05's four concurrent calls landed within a 160 ms spread (9.57–9.73 s) — the shared endpoint dispatched them without serializing.
 - The absolute wall figures include shared-endpoint queue time (the trial endpoint returned HTTP 429 `queue_exceeded` on 4 of 17 collection attempts during peak congestion; those attempts are excluded, and retry behavior is bounded).
 - `output_tps` (decode-only) and `ttft_s` are **absent** — the harness surface does not expose them yet; wiring API `time_info` into the run record is Roadmap item #2.
+
+## Official-run evidence (redacted)
+
+`bench/official-run-usage.json` — the token/cache/verdict record of the official PR #5 loop run (no secrets): input 16,995 · output 3,901 · cacheRead 189,440 · reasoning 1,629 · score 100 · iteration 1 · verify 2.60 s · publish 9.53 s.
+
+Medians are wall-clock seconds end-to-end (see methodology above).
 
 ## Reproducing
 

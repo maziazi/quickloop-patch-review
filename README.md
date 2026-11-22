@@ -87,17 +87,17 @@ OPTION B (If hosted externally): Replace Option A with a linked preview image:
 | Prevents deleting or weakening failing tests (`S_scope`) | N/A | Vulnerable | Immediate revert and `BLOCKED` |
 | Avoids bikeshedding `MINOR` style and naming findings | Noisy comments | Infinite churn | Reported only, never patched |
 | Byte-stable prefix caching (`> 80%` cache hit rate) | No | History appended | Static prefix with replaced tail |
-| Honest API telemetry (`queue`, `output_tps`, `e2e_tps`) | No | Often omitted | Sourced from API fields; persisted to `.quickloop/run-<pr>.json` via the harness integration (see [Roadmap](#roadmap)) |
+| Honest API telemetry (`queue`, `output_tps`, `e2e_tps`) | No | Often omitted | Sourced from API fields; will be persisted to `.quickloop/run-<pr>.json` via the harness integration (see [Roadmap](#roadmap)) |
 
 ---
 
 ## Benchmarks and Honest TPS Telemetry
 
-Every performance figure in this repository is recorded directly from Cerebras API `usage` / `time_info` fields and local monotonic clocks — persisted to `.quickloop/run-<pr>.json` as the harness integration lands — never estimated with a local tokenizer. Server queueing (`queue_time_s`), pure decode rate (`output_tps`), and caller-experienced throughput (`e2e_tps`) are reported separately across **3–5 repeated runs** to demonstrate both speed and run-to-run consistency.
+Every performance figure in this repository comes from real runs — Cerebras API `usage` fields (token + cache counts) and local monotonic clocks (wall time) — never estimated with a tokenizer. The harness CLI does **not** yet surface `queue_time_s` / `ttft_s` / `output_tps` / `e2e_tps`; per our honesty rule those are reported **absent** (n/a† below), not invented, until the wiring lands (see [Roadmap](#roadmap)).
 
 ### Engineering Targets vs. Measured Hardware and Worker Overhead
 
-| Component | Target | Measured (Median) | Notes |
+| Component | Target | Measured (Median / Mean) | Notes |
 | :--- | :--- | :--- | :--- |
 | Rust worker cold start (`quickloop --version`) | `< 15 ms` | **`4.4 ms`** (50-run mean incl. fork overhead) | Minimal dependencies (`clap`, `serde`, `std::process::Command`) |
 | Diff extraction and noise filtering (`quickloop diff`) | `< 400 ms` | **`2.43 s`** incl. 2 `gh` API round-trips (local parse ≈ ms) | Strips lockfiles, `dist/`, `vendor/`, and binary diffs |
@@ -115,9 +115,9 @@ Every performance figure in this repository is recorded directly from Cerebras A
 </div>
 -->
 
-### Baseline Suite (`BL-01`–`BL-05`) — Median and Consistency Range (N = 3–5 runs)
+### Baseline Suite (`BL-01`–`BL-05`) — Median and Consistency Range (N as run)
 
-| Suite | Scenario | Cache State | `queue_time_s` (Med) | `ttft_s` (Med) | `output_tps` (Med / Min–Max) | `e2e_tps` (Med) | `cache_hit_rate` |
+| Suite | Scenario | Cache State | `queue_time_s` | `ttft_s` | `output_tps` | `wall_s` (Med / Min–Max) | `cache_hit_rate` |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **BL-01** | Sanity short reply (16 chars out) | Warm | n/a† | n/a† | n/a† | **15.05 s** (12.86–15.36) | — |
 | **BL-02** | Medium code generation (~2.1 KB Rust out) | Warm | n/a† | n/a† | n/a† | **20.95 s** (20.67–26.46) | — |
@@ -125,11 +125,13 @@ Every performance figure in this repository is recorded directly from Cerebras A
 | **BL-04** | Multi-step loop (official PR #5 run) | Cold -> Warm | n/a† | n/a† | n/a† | turn 440 s incl. endpoint backoff; worker gates 2.60 / 9.53 s | **91.8%** (189,440 tokens) |
 | **BL-05** | Disjoint parallel fan-out (`concurrency = 4`) | Warm | n/a† | n/a† | n/a† | **9.61 s** (9.57–9.73, 160 ms spread) | — |
 
+*† `queue_time_s` / `ttft_s` / `output_tps` are not surfaced by the harness CLI yet (Roadmap). BL-01/BL-03 ran as scaled-down probes to conserve the shared endpoint's uncached TPM; full-budget runs at the [`docs/DESIGN.md`](./docs/DESIGN.md) spec sizes are deferred until that wiring lands.*
+
 ### Sample Run Output (`demo-repo/` PR #5)
 
 ```text
 QuickLoop · PR #5 · READY_TO_MERGE
-  iterations        3  (iter 0 review: cold · iter 1–2 patch: warm cache)
+  iterations        1  (verify 100 on the first gate pass; `QuickLoop-Iteration: 1`)
   wall clock        440 s end-to-end incl. shared-endpoint backoff · worker gates 12.1 s
   tokens            in 16,995 (cached read 189,440 · 91.8%) · out 3,901 · reasoning 1,629
   checks            tests PASS · lint clean · security clean · scope ok (score 100/100)
@@ -196,7 +198,7 @@ Latency optimization is aligned with the physical characteristics of `moonshotai
 | **Minimal `SEARCH/REPLACE` Hunks** | Emits ~400 output tokens instead of ~5,000-token full-file rewrites | Cuts memory-bandwidth-bound decode duration by ~5–10x |
 | **Asymmetric Reasoning Dial** | `reasoning_effort: low` in Phase 2 review; **OFF** in Phase 3 patch synthesis | Eliminates redundant reasoning tokens on the hot patch path |
 | **Replaceable Failure Tail** | Overwrites prior `verify` failure output rather than appending | Prevents linear KV-cache bloat across Kimi's 24 DSA layers |
-| **Pinned Tool Policy + Rust CLI** | OpenClaw restricted to `exec` and `read`; `< 15 ms` native Rust binary | Zero unused tool schema overhead and sub-300 ms local verification |
+| **Pinned Tool Policy + Rust CLI** | OpenClaw restricted to `exec` and `read`; `4.4 ms` native Rust binary | Zero unused tool schema overhead; ms-scale local scans (gate wall is cargo-dominated) |
 
 See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) for the complete system specification, schemas, nested control loops, and failure recovery matrix.
 
