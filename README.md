@@ -47,15 +47,9 @@
 
 ## Demo
 
-<!--
-OPTION A (Recommended for GitHub): Drag and drop your .mp4 recording into any GitHub Issue or PR comment box,
-copy the generated `https://github.com/user-attachments/assets/<uuid>` URL, and paste it on its own line below.
-GitHub automatically renders an inline native video player.
--->
-
 <div align="center">
 
-`https://github.com/user-attachments/assets/REPLACE_WITH_YOUR_DEMO_VIDEO_ID`
+https://github.com/user-attachments/assets/a1093686-1ed7-4d81-beea-a2cd1fa25aeb
 
 <!--
 OPTION B (If hosted externally): Replace Option A with a linked preview image:
