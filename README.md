@@ -87,7 +87,7 @@ OPTION B (If hosted externally): Replace Option A with a linked preview image:
 | Prevents deleting or weakening failing tests (`S_scope`) | N/A | Vulnerable | Immediate revert and `BLOCKED` |
 | Avoids bikeshedding `MINOR` style and naming findings | Noisy comments | Infinite churn | Reported only, never patched |
 | Byte-stable prefix caching (`> 80%` cache hit rate) | No | History appended | Static prefix with replaced tail |
-| Honest API telemetry (`queue`, `output_tps`, `e2e_tps`) | No | Often omitted | Logged per run from API fields |
+| Honest API telemetry (`queue`, `output_tps`, `e2e_tps`) | No | Often omitted | Sourced from API fields; persisted to `.quickloop/run-<pr>.json` via the harness integration (see [Roadmap](#roadmap)) |
 
 ---
 
@@ -346,13 +346,13 @@ An honest assessment of what QuickLoop does well today, and where it goes next. 
 | :--- | :--- | :--- |
 | **CI** | No GitHub Actions workflow yet — the four verification gates exist only as documented local commands | Add `.github/workflows/ci.yml` running `fmt --check` / `clippy -D warnings` / `test --workspace` / `build --release` on every PR |
 | **API-side telemetry** | `RunRecord` persists worker-measured fields (`score`, walls, commit, comment); Cerebras `queue_time_s` / `ttft_s` / `output_tps` / `e2e_tps` / `cache_hit_rate` are not wired into it yet | Capture the API `usage` / `time_info` fields in the OpenClaw harness path and persist them into `.quickloop/run-<pr>.json` (unlocks the BL-01–BL-05 tables and the TPS bounty) |
-| **Repo-root assumption** | `ensure_local_exclude` and the comment-body path assume `quickloop` is invoked from the repository root (true per the skills contract; breaks from a subdirectory) | Resolve the top-level via `git rev-parse --show-toplevel` and anchor every path there |
+| **Repo-root assumption** | `ensure_local_exclude` and the comment-body path assume `quickloop` is invoked from the repository root (true for the documented invocation flow (session pointed at the repo root); breaks from a subdirectory) | Resolve the top-level via `git rev-parse --show-toplevel` and anchor every path there |
 | **Language coverage** | `verify` hardcodes `cargo test` / `cargo clippy` — QuickLoop loops Rust repositories only | Per-repo check configuration (`.quickloop.toml`: test/lint/sec commands) so any language with a deterministic gate can be looped |
 | **Security-scan depth** | `S_sec` is a 10-pattern hardcoded scan (backdoor keys, private keys, AWS keys, credential literals) — a tripwire, not a SAST | Plug in real tooling (`cargo-audit`, `semgrep`) as an additional check while keeping the deterministic-gate contract |
 | **Staging scope** | `git add -u` stages modifications/deletions of all tracked files — correct for the loop's own patches, but an agent side command that edits an unrelated tracked file would ride along | Stage exactly the paths changed since baseline (`baseline.json` `changed_paths`) for defense in depth |
 | **Comment pagination** | The status-comment upsert scans only the first 100 PR comments (documented limitation) | Paginate via `Link` headers or search by marker directly |
 | **Platform coverage** | Real-publish path is integration-tested on unix only (`sh` shim); no Windows CI | Windows runner job + a portable shim strategy |
-| **Fan-out** | The loop runs one PR per session; BL-05 sketches disjoint parallel runs | A coordinator mode fanning out over multiple open PRs with per-PR state isolation |
+| **Fan-out** | The loop runs one PR per session; BL-05's fan-out is disjoint *files* within one PR | A coordinator mode fanning out over multiple open PRs with per-PR state isolation |
 | **Trigger surface** | Invoked manually (slash skill or `openclaw agent -m`) | GitHub App / Actions mode: run QuickLoop automatically on every newly opened PR |
 
 ---
