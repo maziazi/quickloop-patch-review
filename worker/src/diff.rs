@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use crate::gh;
 use crate::git;
@@ -118,14 +119,29 @@ pub fn run(pr_ref: &str) -> Result<(), String> {
     validate_pr_ref(pr_ref)?;
     // Runtime artifacts must never leak into the user's repository.
     git::ensure_local_exclude(".quickloop/")?;
-    let meta = gh::run(&[
-        "pr",
-        "view",
-        pr_ref,
-        "--json",
-        "number,baseRefOid,headRefOid",
-    ])?;
-    let meta: serde_json::Value = serde_json::from_str(meta.trim())
+    // The two GitHub round-trips are independent — run them concurrently so
+    // the diff wall is one network RTT, not two back-to-back ones.
+    let (meta_raw, raw) = thread::scope(|s| {
+        let meta_handle = s.spawn(|| {
+            gh::run(&[
+                "pr",
+                "view",
+                pr_ref,
+                "--json",
+                "number,baseRefOid,headRefOid",
+            ])
+        });
+        let diff_handle = s.spawn(|| gh::run(&["pr", "diff", pr_ref]));
+        let join = |h: std::thread::ScopedJoinHandle<'_, Result<String, String>>, what: &str| {
+            h.join()
+                .unwrap_or_else(|_| Err(format!("{what} thread panicked")))
+        };
+        (
+            join(meta_handle, "gh pr view"),
+            join(diff_handle, "gh pr diff"),
+        )
+    });
+    let meta: serde_json::Value = serde_json::from_str(meta_raw?.trim())
         .map_err(|e| format!("gh pr view returned invalid JSON: {e}"))?;
     let pr = meta["number"]
         .as_u64()
@@ -139,7 +155,7 @@ pub fn run(pr_ref: &str) -> Result<(), String> {
         .ok_or("gh pr view: missing field 'headRefOid'")?
         .to_string();
 
-    let raw = gh::run(&["pr", "diff", pr_ref])?;
+    let raw = raw?;
     let files = parse_and_filter(&raw);
     let changed_paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
     let test_file_count = count_protected_files(Path::new("."))?;

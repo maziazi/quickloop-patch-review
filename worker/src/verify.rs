@@ -179,16 +179,119 @@ fn score_of(checks: &Checks) -> u32 {
         + 10 * u32::from(checks.scope)
 }
 
+/// Cargo argument scope for the gate: `-p <pkg>` per workspace member whose
+/// directory intersects a changed path, or `--workspace` when nothing maps.
+/// Member directories come from the root `Cargo.toml`; package names from
+/// each member's own `[package] name`. Any parse trouble falls back to
+/// `--workspace` — scoping is an optimization, never a completeness risk.
+fn cargo_scope_args(changed: &[String]) -> Vec<String> {
+    let Ok(root_manifest) = fs::read_to_string("Cargo.toml") else {
+        return vec!["--workspace".to_string()];
+    };
+    let members = workspace_members(&root_manifest);
+    if members.is_empty() {
+        return vec!["--workspace".to_string()];
+    }
+    let mut packages = Vec::new();
+    for member in members {
+        let member_prefix = format!("{member}/");
+        if !changed.iter().any(|path| path.starts_with(&member_prefix)) {
+            continue;
+        }
+        let Some(name) = package_name(Path::new(&member)) else {
+            return vec!["--workspace".to_string()];
+        };
+        packages.push(name);
+    }
+    if packages.is_empty() {
+        return vec!["--workspace".to_string()];
+    }
+    let mut args = Vec::with_capacity(packages.len() * 2);
+    for name in packages {
+        args.push("-p".to_string());
+        args.push(name);
+    }
+    args
+}
+
+/// `members = [...]` array entries from a workspace `Cargo.toml` — a tiny
+/// targeted scan rather than a toml dependency (see §5.3 dependency diet).
+fn workspace_members(manifest: &str) -> Vec<String> {
+    let mut members = Vec::new();
+    let mut in_array = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("members") {
+            if let Some(items) = rest
+                .trim_start()
+                .strip_prefix('=')
+                .and_then(|s| s.trim_start().strip_prefix('['))
+            {
+                in_array = true;
+                for item in items.split(',') {
+                    push_member(item, &mut members);
+                }
+                if items.contains(']') {
+                    in_array = false;
+                }
+                continue;
+            }
+        } else if in_array {
+            for item in line.split(',') {
+                push_member(item, &mut members);
+            }
+            if line.contains(']') {
+                in_array = false;
+            }
+        }
+    }
+    members
+}
+
+fn push_member(item: &str, members: &mut Vec<String>) {
+    let item = item.trim().trim_end_matches(']').trim();
+    let Some(quoted) = item.strip_prefix('"') else {
+        return;
+    };
+    let value = quoted.trim_end_matches('"');
+    if !value.is_empty() {
+        members.push(value.to_string());
+    }
+}
+
+/// The `[package] name` of a member crate: the first `name = "..."` before
+/// any dependency section starts (package metadata always precedes deps).
+fn package_name(member_dir: &Path) -> Option<String> {
+    let manifest = fs::read_to_string(member_dir.join("Cargo.toml")).ok()?;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("name = ") {
+            return Some(rest.trim().trim_matches('"').to_string());
+        }
+        if line == "[dependencies]" || line == "[dev-dependencies]" {
+            break;
+        }
+    }
+    None
+}
+
 /// Run test/lint/security checks concurrently (cargo serializes itself on
 /// the target-dir lock, the security scan is pure I/O).
+///
+/// Cargo scope: only workspace members whose directories intersect the
+/// changed paths are re-checked. Sound because an unchanged member cannot
+/// produce new lint or test failures; when nothing maps to a member (e.g.
+/// a root-level file or a standalone cargo project without a members
+/// list), fall back to the whole workspace.
 fn run_checks_concurrent(
     changed: &[String],
 ) -> Result<(CheckResult, CheckResult, CheckResult), String> {
     let changed_owned = changed.to_vec();
+    let cargo_scope = cargo_scope_args(&changed_owned);
     thread::scope(
         |s| -> Result<(CheckResult, CheckResult, CheckResult), String> {
-            let test_handle = s.spawn(run_test_check);
-            let lint_handle = s.spawn(run_lint_check);
+            let test_handle = s.spawn(|| run_test_check(&cargo_scope));
+            let lint_handle = s.spawn(|| run_lint_check(&cargo_scope));
             let sec_handle = s.spawn(|| run_sec_check(&changed_owned));
             let join = |handle: thread::ScopedJoinHandle<'_, Result<CheckResult, String>>| {
                 handle.join().unwrap_or_else(|_| {
@@ -203,8 +306,10 @@ fn run_checks_concurrent(
     )
 }
 
-fn run_test_check() -> Result<CheckResult, String> {
-    let output = run_tool("cargo", &["test", "--workspace"], TOOL_TIMEOUT_SECS)?;
+fn run_test_check(scope: &[String]) -> Result<CheckResult, String> {
+    let mut args = vec!["test"];
+    args.extend(scope.iter().map(String::as_str));
+    let output = run_tool("cargo", &args, TOOL_TIMEOUT_SECS)?;
     if output.timed_out {
         return Ok(failed(vec![format!(
             "cargo test timed out after {TOOL_TIMEOUT_SECS}s"
@@ -216,12 +321,13 @@ fn run_test_check() -> Result<CheckResult, String> {
     Ok(failed(concise_failures(&output.stdout, &output.stderr)))
 }
 
-fn run_lint_check() -> Result<CheckResult, String> {
-    let output = run_tool(
-        "cargo",
-        &["clippy", "--workspace", "--", "-D", "warnings"],
-        TOOL_TIMEOUT_SECS,
-    )?;
+fn run_lint_check(scope: &[String]) -> Result<CheckResult, String> {
+    let mut args = vec!["clippy"];
+    args.extend(scope.iter().map(String::as_str));
+    args.push("--");
+    args.push("-D");
+    args.push("warnings");
+    let output = run_tool("cargo", &args, TOOL_TIMEOUT_SECS)?;
     if output.timed_out {
         return Ok(failed(vec![format!(
             "cargo clippy timed out after {TOOL_TIMEOUT_SECS}s"
@@ -462,8 +568,8 @@ fn concise_failures(stdout: &str, stderr: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        changed_since_baseline, evaluate, read_baseline, score_of, status_changed_fields,
-        SEC_PATTERNS,
+        cargo_scope_args, changed_since_baseline, evaluate, read_baseline, score_of,
+        status_changed_fields, workspace_members, SEC_PATTERNS,
     };
     use crate::testutil::with_cwd;
     use crate::verify::Checks;
@@ -528,6 +634,74 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8(out.stdout).expect("utf8")
+    }
+
+    #[test]
+    fn cargo_scope_maps_changed_paths_to_member_packages() {
+        let manifest = "# comment\n[workspace]\nresolver = \"2\"\nmembers = [\n  \"worker\",\n  \"demo-repo\",\n]\ndefault-members = [\"worker\"]\n";
+        assert_eq!(workspace_members(manifest), vec!["worker", "demo-repo"]);
+        // Multi-item single line, spacing variants.
+        assert_eq!(
+            workspace_members("members = [\"a\", \"b\"]"),
+            vec!["a", "b"]
+        );
+        // No members list (standalone project) → empty.
+        assert!(workspace_members("[package]\nname = \"x\"\n").is_empty());
+    }
+
+    #[test]
+    fn cargo_scope_args_fall_back_to_workspace_safely() {
+        let root =
+            std::env::temp_dir().join(format!("quickloop-scope-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        with_cwd(&root, || {
+            // No readable root manifest → whole workspace, never an empty scope.
+            assert_eq!(cargo_scope_args(&["src/x.rs".to_string()]), ["--workspace"]);
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cargo_scope_scopes_to_intersecting_members_only() {
+        let root = std::env::temp_dir().join(format!("quickloop-scope-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("worker/src")).unwrap();
+        fs::create_dir_all(root.join("demo-repo/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"worker\", \"demo-repo\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("worker/Cargo.toml"),
+            "[package]\nname = \"quickloop\"\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("demo-repo/Cargo.toml"),
+            "[package]\nname = \"demo_repo\"\n",
+        )
+        .unwrap();
+        with_cwd(&root, || {
+            assert_eq!(
+                cargo_scope_args(&["demo-repo/src/auth.rs".to_string()]),
+                ["-p", "demo_repo"]
+            );
+            assert_eq!(
+                cargo_scope_args(&[
+                    "demo-repo/src/auth.rs".to_string(),
+                    "worker/src/main.rs".to_string()
+                ]),
+                ["-p", "quickloop", "-p", "demo_repo"]
+            );
+            // Root-level file outside any member → whole workspace.
+            assert_eq!(
+                cargo_scope_args(&["README.md".to_string(), "Cargo.lock".to_string()]),
+                ["--workspace"]
+            );
+        });
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
