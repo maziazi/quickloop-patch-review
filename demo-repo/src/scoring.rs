@@ -1,12 +1,10 @@
-// Decay divisor: days per month.
-//
-// NOTE: the QuickLoop demo PR (`demo/planted-bugs`) ships a broken zero
-// divisor that makes `decayed_score` panic; this clean version is the
-// post-loop state that `tests/regression_test.rs` expects.
-const DECAY_DIVISOR_STR: &str = "30";
+// Planted CRITICAL (logic): the deployed config shipped a zero divisor, so
+// any call to `decayed_score` panics with "attempt to divide by zero".
+// The correct divisor is 30.
+const DECAY_DIVISOR_STR: &str = "0";
 
 fn decay_divisor() -> u32 {
-    DECAY_DIVISOR_STR.parse().unwrap_or(30)
+    DECAY_DIVISOR_STR.parse().unwrap_or(0)
 }
 
 /// Decay a raw score by the age of the associated finding, in days.
